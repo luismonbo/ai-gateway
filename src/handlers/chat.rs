@@ -1,11 +1,11 @@
-use actix_web::{web, HttpResponse, HttpRequest, HttpMessage};
-use crate::models::{ChatCompletionRequest};
+use crate::middleware::auth::ValidatedApiKey;
+use crate::models::ChatCompletionRequest;
 use crate::providers::{LLMProvider, ProviderError};
 use crate::tracking::RequestTracker;
-use crate::middleware::auth::ValidatedApiKey;
-use tracing::{info, error};
-use std::sync::RwLock;
+use actix_web::{web, HttpMessage, HttpRequest, HttpResponse};
 use futures::StreamExt;
+use std::sync::RwLock;
+use tracing::{error, info};
 
 pub async fn chat_completions(
     req: HttpRequest,
@@ -20,18 +20,19 @@ pub async fn chat_completions(
     if is_streaming {
         info!("Streaming request received");
 
-        let api_key = req.extensions()
+        let api_key = req
+            .extensions()
             .get::<ValidatedApiKey>()
             .map(|k| k.key.clone())
             .unwrap_or_else(|| "unknown".to_string());
-            
+
         match provider.chat_stream(request).await {
             Ok(stream) => {
                 let tracker_for_closure = request_tracker.clone(); // Clone the Arc<RwLock<RequestTracker>>
 
                 let stream = stream.map(move |result| {
                     if let Ok(bytes) = &result {
-                        
+
                         let s = String::from_utf8_lossy(bytes);
                         if s.starts_with("data: ") && !s.contains("[DONE]") {
                              let json_str = s.trim_start_matches("data: ").trim();
@@ -40,7 +41,7 @@ pub async fn chat_completions(
                                      let prompt_tokens = usage.prompt_tokens as u64;
                                      let completion_tokens = usage.completion_tokens as u64;
                                      let model = &chunk.model;
-                                     
+
                                      if let Ok(mut t) = tracker_for_closure.write() {
                                          t.record_tokens(&api_key, prompt_tokens, completion_tokens, model);
                                           info!("Recorded streaming tokens: {}p + {}c for {}", prompt_tokens, completion_tokens, api_key);
@@ -55,8 +56,8 @@ pub async fn chat_completions(
                 });
 
                 HttpResponse::Ok()
-                .content_type("text/event-stream")
-                .streaming(stream)
+                    .content_type("text/event-stream")
+                    .streaming(stream)
             }
             Err(e) => error_to_response(e),
         }
@@ -90,7 +91,7 @@ pub async fn chat_completions(
                 }
 
                 HttpResponse::Ok().json(response)
-            },
+            }
             Err(e) => error_to_response(e),
         }
     }
@@ -104,7 +105,7 @@ fn error_to_response(err: ProviderError) -> HttpResponse {
         ProviderError::Parse(msg) => {
             HttpResponse::InternalServerError().body(format!("Failed to parse response: {}", msg))
         }
-        ProviderError::ProviderError { status, message } => HttpResponse::build(
+        ProviderError::Status { status, message } => HttpResponse::build(
             actix_web::http::StatusCode::from_u16(status)
                 .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR),
         )

@@ -79,7 +79,7 @@ impl RateLimiter {
             Mutex::new(Bucket::new(self.default_capacity, self.default_refill_rate))
         });
 
-        let mut bucket = bucket_mutex.lock().unwrap();
+        let bucket = bucket_mutex.get_mut().unwrap();
         bucket.try_consume()
     }
 }

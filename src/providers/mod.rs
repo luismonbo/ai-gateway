@@ -15,7 +15,7 @@ use crate::models::{ChatCompletionRequest, ChatCompletionResponse};
 pub enum ProviderError {
     Network(String),
     Parse(String),
-    ProviderError { status: u16, message: String },
+    Status { status: u16, message: String },
 }
 
 impl fmt::Display for ProviderError {
@@ -23,7 +23,7 @@ impl fmt::Display for ProviderError {
         match self {
             ProviderError::Network(msg) => write!(f, "Network error: {}", msg),
             ProviderError::Parse(msg) => write!(f, "Parse error: {}", msg),
-            ProviderError::ProviderError { status, message } => {
+            ProviderError::Status { status, message } => {
                 write!(f, "Provider error ({}): {}", status, message)
             }
         }

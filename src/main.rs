@@ -1,15 +1,9 @@
-mod handlers;
-mod middleware;
-mod models;
-mod providers;
-mod tracking;
-
-use crate::{
+use ai_gateway::{
+    handlers::{chat_completions, get_stats},
     middleware::{AuthMiddleware, RateLimitMiddleware, RateLimiter, TrackingMiddleware},
+    providers::{ollama::OllamaProvider, openai::OpenAIProvider, FallbackProvider, LLMProvider},
     tracking::RequestTracker,
 };
-use handlers::{chat_completions, get_stats};
-use providers::{ollama::OllamaProvider, openai::OpenAIProvider, FallbackProvider, LLMProvider};
 
 use actix_web::{middleware::Logger, web, App, HttpResponse, HttpServer};
 use dotenv::dotenv;

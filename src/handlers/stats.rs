@@ -1,10 +1,9 @@
-use actix_web::{web, HttpRequest, HttpResponse, HttpMessage};
 use crate::middleware::auth::{ApiKeyRole, ValidatedApiKey};
 use crate::tracking::RequestTracker;
+use actix_web::{web, HttpMessage, HttpRequest, HttpResponse};
 use serde::Serialize;
-use std::sync::{RwLock};
 use std::collections::HashMap;
-
+use std::sync::RwLock;
 
 #[derive(serde::Deserialize)]
 pub struct StatsQuery {
@@ -13,7 +12,7 @@ pub struct StatsQuery {
 
 #[derive(Serialize)]
 pub struct KeyStatsResponse {
-    pub api_key: String,  // Will be masked
+    pub api_key: String, // Will be masked
     pub request_count: u64,
     pub error_count: u64,
     pub total_latency_ms: u64,
@@ -44,15 +43,13 @@ pub async fn get_stats(
         ApiKeyRole::Admin => {
             match &query.key {
                 // Admin requesting specific key's stats
-                Some(target_key) => {
-                    match tracker_guard.get_stats(target_key) {
-                        Some(stats) => {
-                            let response = build_stats_response(target_key, stats);
-                            HttpResponse::Ok().json(response)
-                        }
-                        None => HttpResponse::NotFound().body("No stats for that key"),
+                Some(target_key) => match tracker_guard.get_stats(target_key) {
+                    Some(stats) => {
+                        let response = build_stats_response(target_key, stats);
+                        HttpResponse::Ok().json(response)
                     }
-                }
+                    None => HttpResponse::NotFound().body("No stats for that key"),
+                },
                 // Admin requesting all stats
                 None => {
                     let all_stats: Vec<KeyStatsResponse> = tracker_guard

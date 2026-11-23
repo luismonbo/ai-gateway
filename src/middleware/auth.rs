@@ -29,7 +29,7 @@ pub struct AuthMiddleware {
 impl AuthMiddleware {
     pub fn new(api_keys: Vec<String>, admin_keys: Vec<String>) -> Self {
         Self {
-            api_keys: api_keys,
+            api_keys,
             admin_keys,
         }
     }
@@ -106,7 +106,7 @@ where
                     role: r,
                 });
                 let fut = self.service.call(req);
-                Box::pin(async move { fut.await })
+                Box::pin(fut)
             }
             None => {
                 info!("Auth Failed. Token extracted: {:?}", token);

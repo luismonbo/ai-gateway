@@ -2,11 +2,11 @@
 /target
 **/*.rs.bk
 
-# Dependencies
-Cargo.lock
-
 # Environment (contains secrets)
 .env
+
+# Gateway stats (usage per key)
+stats.json*
 
 # macOS
 .DS_Store
