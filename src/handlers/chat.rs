@@ -1,14 +1,14 @@
-use crate::middleware::auth::ValidatedApiKey;
+use crate::auth::Caller;
 use crate::models::ChatCompletionRequest;
 use crate::providers::{LLMProvider, ProviderError};
 use crate::tracking::RequestTracker;
-use actix_web::{web, HttpMessage, HttpRequest, HttpResponse};
+use actix_web::{web, HttpResponse};
 use futures::StreamExt;
 use std::sync::RwLock;
 use tracing::{error, info};
 
 pub async fn chat_completions(
-    req: HttpRequest,
+    caller: Caller,
     provider: web::Data<dyn LLMProvider>,
     request_tracker: web::Data<RwLock<RequestTracker>>,
     body: web::Json<ChatCompletionRequest>,
@@ -20,11 +20,7 @@ pub async fn chat_completions(
     if is_streaming {
         info!("Streaming request received");
 
-        let api_key = req
-            .extensions()
-            .get::<ValidatedApiKey>()
-            .map(|k| k.key.clone())
-            .unwrap_or_else(|| "unknown".to_string());
+        let key_id = caller.key_id.to_string();
 
         match provider.chat_stream(request).await {
             Ok(stream) => {
@@ -43,8 +39,8 @@ pub async fn chat_completions(
                                      let model = &chunk.model;
 
                                      if let Ok(mut t) = tracker_for_closure.write() {
-                                         t.record_tokens(&api_key, prompt_tokens, completion_tokens, model);
-                                          info!("Recorded streaming tokens: {}p + {}c for {}", prompt_tokens, completion_tokens, api_key);
+                                         t.record_tokens(&key_id, prompt_tokens, completion_tokens, model);
+                                         info!(key_id = %key_id, prompt_tokens, completion_tokens, "Recorded streaming tokens");
                                      } else {
                                          error!("Failed to acquire write lock on RequestTracker for streaming usage");
                                      }
@@ -67,27 +63,23 @@ pub async fn chat_completions(
         match provider.chat(request).await {
             Ok(response) => {
                 // Record token usage
-                if let Some(extensions) = req.extensions().get::<ValidatedApiKey>() {
-                    let api_key = &extensions.key;
-                    let prompt_tokens = response.usage.prompt_tokens as u64;
-                    let completion_tokens = response.usage.completion_tokens as u64;
-                    let model = response.model.clone();
+                let key_id = caller.key_id.as_str();
+                let prompt_tokens = response.usage.prompt_tokens as u64;
+                let completion_tokens = response.usage.completion_tokens as u64;
+                let model = response.model.clone();
 
-                    // Acquire write lock and record
-                    if let Ok(mut tracker) = request_tracker.write() {
-                        tracker.record_tokens(api_key, prompt_tokens, completion_tokens, &model);
-                        info!(
-                            api_key = %api_key,
-                            prompt_tokens = prompt_tokens,
-                            completion_tokens = completion_tokens,
-                            model = %model,
-                            "Recorded tokens"
-                        );
-                    } else {
-                        error!("Failed to acquire write lock on RequestTracker");
-                    }
+                // Acquire write lock and record
+                if let Ok(mut tracker) = request_tracker.write() {
+                    tracker.record_tokens(key_id, prompt_tokens, completion_tokens, &model);
+                    info!(
+                        key_id = %key_id,
+                        prompt_tokens = prompt_tokens,
+                        completion_tokens = completion_tokens,
+                        model = %model,
+                        "Recorded tokens"
+                    );
                 } else {
-                    error!("ValidatedApiKey missing from request extensions");
+                    error!("Failed to acquire write lock on RequestTracker");
                 }
 
                 HttpResponse::Ok().json(response)

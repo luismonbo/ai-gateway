@@ -1,140 +1,131 @@
-use ai_gateway::{
-    handlers::{chat_completions, get_stats},
-    middleware::{AuthMiddleware, RateLimitMiddleware, RateLimiter, TrackingMiddleware},
-    providers::{ollama::OllamaProvider, openai::OpenAIProvider, FallbackProvider, LLMProvider},
-    tracking::RequestTracker,
+use actix_web::{web, HttpServer};
+use ai_gateway::app::{build_app, AppState};
+use ai_gateway::auth::Role;
+use ai_gateway::config::{Config, LogFormat};
+use ai_gateway::logging::init_logging;
+use ai_gateway::middleware::RateLimiter;
+use ai_gateway::providers::{
+    ollama::OllamaProvider, openai::OpenAIProvider, FallbackProvider, LLMProvider,
 };
-
-use actix_web::{middleware::Logger, web, App, HttpResponse, HttpServer};
-use dotenv::dotenv;
+use ai_gateway::tracking::RequestTracker;
 use std::env;
-use std::sync::{Arc, RwLock};
-use tracing::info;
+use std::process::ExitCode;
+use std::sync::{Arc, PoisonError, RwLock};
+use tracing::{error, info, warn};
 
-async fn health() -> HttpResponse {
-    HttpResponse::Ok().body("ok")
-}
+const STATS_PATH: &str = "stats.json";
 
 #[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    let log_format = std::env::var("LOG_FORMAT").unwrap_or_else(|_| "text".to_string());
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+async fn main() -> ExitCode {
+    // Load .env before anything reads the environment, so LOG_FORMAT and
+    // RUST_LOG set there apply to logging. Its result is reported once
+    // logging is up.
+    let dotenv = dotenvy::dotenv();
+    let config = Config::from_env();
+    let log_format = config
+        .as_ref()
+        .map(|(config, _)| config.log_format)
+        .unwrap_or(LogFormat::Text);
+    init_logging(log_format);
 
-    if log_format.to_lowercase() == "json" {
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(env_filter)
-            .init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
-    }
-
-    dotenv().ok();
-
-    let raw_keys = env::var("GATEWAY_API_KEYS").unwrap_or_else(|_| "secret-key".to_string());
-    let raw_admin_keys = env::var("ADMIN_API_KEYS").unwrap_or_else(|_| String::new());
-
-    let api_keys: Vec<String> = raw_keys
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    let admin_keys: Vec<String> = raw_admin_keys
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    info!("Loaded {} API keys.", api_keys.len());
-    info!("Loaded {} admin API keys.", admin_keys.len());
-
-    let ollama_provider = Arc::new(OllamaProvider::new(
-        env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://localhost:11434".to_string()),
-    ));
-
-    let openai_provider =
-        if let (Ok(key), Ok(url)) = (env::var("OPENAI_API_KEY"), env::var("OPENAI_BASE_URL")) {
-            Some(Arc::new(OpenAIProvider::new(url, key)))
-        } else {
-            None
-        };
-
-    // Default strategy: Try Ollama, allow fallback to OpenAI if configured
-    let provider: Arc<dyn LLMProvider> = if let Some(secondary) = openai_provider {
-        // If we have both, use FallbackProvider
-        // We configure a default OpenAI model for fallback in case the original model (e.g. local LLM) doesn't exist in OpenAI
-        Arc::new(FallbackProvider::new(
-            ollama_provider,
-            secondary,
-            Some("gpt-4.1-nano".to_string()),
-        ))
-    } else {
-        // If only Ollama, just use Ollama
-        ollama_provider
-    };
-
-    info!("AI Provider configured. Fallback strategy active if OpenAI keys present.");
-
-    let request_tracker = match RequestTracker::load_from_file("stats.json") {
-        Ok(tracker) => {
-            info!("Loaded existing request stats from stats.json");
-            Arc::new(RwLock::new(tracker))
+    match dotenv {
+        Ok(path) => info!("loaded environment from {}", path.display()),
+        Err(e) if e.not_found() => info!("no .env file; using the process environment"),
+        // The parse error holds the offending line, which may hold a secret.
+        Err(dotenvy::Error::LineParse(..)) => {
+            error!(".env has a syntax error; fix it and restart");
+            return ExitCode::FAILURE;
+        }
+        Err(dotenvy::Error::Io(e)) => {
+            error!("could not read .env: {e}");
+            return ExitCode::FAILURE;
         }
         Err(_) => {
-            info!("No existing stats found, starting fresh");
-            Arc::new(RwLock::new(RequestTracker::new()))
+            error!("could not load .env");
+            return ExitCode::FAILURE;
         }
-    };
-
-    let tracker_for_server = request_tracker.clone();
-    let api_keys_for_server = api_keys.clone();
-    let admin_keys_for_server = admin_keys.clone();
-    let provider_for_server = provider.clone();
-
-    let rate_limiter = Arc::new(RateLimiter::new(60)); // 60 RPM
-    let rate_limiter_for_server = rate_limiter.clone();
-
-    let server = HttpServer::new(move || {
-        App::new()
-            .wrap(Logger::default())
-            .wrap(TrackingMiddleware::new(tracker_for_server.clone()))
-            // AuthMiddleware must run BEFORE RateLimitMiddleware to set the key.
-            // Actix middlewares run in REVERSE definition order.
-            // So definition: wrap(RateLimit) -> wrap(Auth)
-            // Execution: Auth -> RateLimit -> Handler
-            .wrap(RateLimitMiddleware::new(rate_limiter_for_server.clone()))
-            .wrap(AuthMiddleware::new(
-                api_keys_for_server.clone(),
-                admin_keys_for_server.clone(),
-            ))
-            // We need to wrap in web::Data here explicitly or inside the App?
-            // In the previous code: `app_data(web::Data::new(request_tracker.clone()))`
-            // `tracker_for_server` is `Arc<RwLock<...>>`. `web::Data` wants to wrap it.
-            .app_data(web::Data::from(tracker_for_server.clone()))
-            .app_data(web::Data::from(provider_for_server.clone()))
-            .service(
-                web::scope("/v1")
-                    .route("/health", web::get().to(health))
-                    .route("/chat/completions", web::post().to(chat_completions))
-                    .route("/stats", web::get().to(get_stats)),
-            )
-    })
-    .bind(("127.0.0.1", 8080))?
-    .run();
-
-    info!("Server running at http://127.0.0.1:8080");
-
-    server.await?;
-
-    info!("Server shutting down, saving stats...");
-    // Save the request tracker before exiting
-    if let Err(e) = request_tracker.read().unwrap().save_to_file("stats.json") {
-        eprintln!("Failed to save request stats: {}", e);
-    } else {
-        info!("Request stats saved to stats.json");
     }
 
-    Ok(())
+    let (config, warnings) = match config {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            error!("invalid configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for warning in &warnings {
+        warn!("{warning}");
+    }
+    info!(
+        user_keys = config.keys.count(Role::User),
+        admin_keys = config.keys.count(Role::Admin),
+        "API keys loaded"
+    );
+
+    let stats = Arc::new(RwLock::new(load_stats()));
+    let state = web::Data::new(AppState {
+        config,
+        stats: stats.clone(),
+        limiter: Arc::new(RateLimiter::new(60)),
+        provider: legacy_provider(),
+    });
+
+    let address = (state.config.host.clone(), state.config.port);
+    let server = HttpServer::new(move || build_app(state.clone())).bind(address.clone());
+    let server = match server {
+        Ok(server) => server,
+        Err(e) => {
+            error!("could not listen on {}:{}: {e}", address.0, address.1);
+            return ExitCode::FAILURE;
+        }
+    };
+    info!("listening on http://{}:{}", address.0, address.1);
+
+    let result = server.run().await;
+    info!("server stopped; saving stats");
+    save_stats(&stats);
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            error!("server error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Today's Ollama-first provider with an OpenAI fallback. Replaced by
+/// configured upstreams later in this branch.
+fn legacy_provider() -> Arc<dyn LLMProvider> {
+    let ollama = Arc::new(OllamaProvider::new(
+        env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://localhost:11434".to_string()),
+    ));
+    match (env::var("OPENAI_API_KEY"), env::var("OPENAI_BASE_URL")) {
+        (Ok(key), Ok(url)) => Arc::new(FallbackProvider::new(
+            ollama,
+            Arc::new(OpenAIProvider::new(url, key)),
+            Some("gpt-4.1-nano".to_string()),
+        )),
+        _ => ollama,
+    }
+}
+
+fn load_stats() -> RequestTracker {
+    match RequestTracker::load_from_file(STATS_PATH) {
+        Ok(tracker) => {
+            info!("loaded request stats from {STATS_PATH}");
+            tracker
+        }
+        Err(_) => {
+            info!("no existing stats found, starting fresh");
+            RequestTracker::new()
+        }
+    }
+}
+
+fn save_stats(stats: &RwLock<RequestTracker>) {
+    let tracker = stats.read().unwrap_or_else(PoisonError::into_inner);
+    match tracker.save_to_file(STATS_PATH) {
+        Ok(()) => info!("saved request stats to {STATS_PATH}"),
+        Err(e) => error!("could not save request stats: {e}"),
+    }
 }

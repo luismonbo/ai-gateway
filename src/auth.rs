@@ -3,9 +3,18 @@
 //! Raw keys are hashed once at startup and then dropped. Everything after
 //! that (logs, stats, `/v1/stats`) only ever sees a [`KeyId`].
 
+use crate::app::AppState;
+use crate::error::ApiError;
+use actix_web::body::{EitherBody, MessageBody};
+use actix_web::dev::{Payload, ServiceRequest, ServiceResponse};
+use actix_web::http::header::AUTHORIZATION;
+use actix_web::middleware::Next;
+use actix_web::{web, FromRequest, HttpMessage, HttpRequest, ResponseError};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
+use std::future::{ready, Ready};
+use tracing::warn;
 
 const KEY_ID_PREFIX: &str = "key_";
 /// Hex characters of the hash kept in a key ID (6 bytes).
@@ -156,6 +165,50 @@ pub fn bearer_token(header: Option<&str>) -> Option<&str> {
     let (scheme, token) = header?.trim().split_once(' ')?;
     let token = token.trim();
     (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
+}
+
+/// Middleware for the `/v1` scope: lets a request through only with a valid
+/// gateway key, and stores the [`Caller`] in the request's extensions.
+///
+/// A rejection is returned as `Ok(response)`, not `Err`, so the access log
+/// (which skips `Err` results) still records the 401.
+pub async fn require_api_key<B: MessageBody>(
+    state: web::Data<AppState>,
+    req: ServiceRequest,
+    next: Next<B>,
+) -> Result<ServiceResponse<EitherBody<B>>, actix_web::Error> {
+    let header = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let caller = bearer_token(header).and_then(|token| state.config.keys.authenticate(token));
+
+    match caller {
+        Some(caller) => {
+            req.extensions_mut().insert(caller);
+            next.call(req)
+                .await
+                .map(ServiceResponse::map_into_left_body)
+        }
+        None => {
+            // Never log the header or the token: a typo'd key is still a secret.
+            warn!(path = %req.path(), "rejected request without a valid API key");
+            let response = ApiError::invalid_api_key().error_response();
+            Ok(req.into_response(response).map_into_right_body())
+        }
+    }
+}
+
+/// Lets handlers take `caller: Caller` as a parameter. Fails closed: without
+/// the auth middleware's extension the request is unauthorized.
+impl FromRequest for Caller {
+    type Error = ApiError;
+    type Future = Ready<Result<Caller, ApiError>>;
+
+    fn from_request(req: &HttpRequest, _payload: &mut Payload) -> Self::Future {
+        let caller = req.extensions().get::<Caller>().cloned();
+        ready(caller.ok_or_else(ApiError::invalid_api_key))
+    }
 }
 
 #[cfg(test)]

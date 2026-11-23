@@ -141,21 +141,23 @@ where
     forward_ready!(service);
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
-        use crate::middleware::auth::ValidatedApiKey;
+        use crate::auth::Caller;
         use actix_web::HttpMessage;
 
         let limiter = self.limiter.clone();
 
-        // Extract API Key from extensions.
-        // Assumes AuthMiddleware ran first (registered LAST in main.rs).
-        let api_key = {
+        // Extract the caller from extensions.
+        // Assumes the auth middleware ran first (it is wrapped last in app.rs).
+        let key_id = {
             let extensions = req.extensions();
-            extensions.get::<ValidatedApiKey>().map(|k| k.key.clone())
+            extensions
+                .get::<Caller>()
+                .map(|caller| caller.key_id.clone())
         };
 
-        if let Some(key) = api_key {
+        if let Some(key_id) = key_id {
             // Check rate limit
-            if !limiter.check_key(&key) {
+            if !limiter.check_key(key_id.as_str()) {
                 // Rate limit exceeded
                 return Box::pin(async {
                     Err(actix_web::error::ErrorTooManyRequests(

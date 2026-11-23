@@ -1,4 +1,4 @@
-use crate::middleware::auth::ValidatedApiKey;
+use crate::auth::Caller;
 use crate::tracking::RequestTracker;
 use actix_web::{
     dev::{Service, ServiceRequest, ServiceResponse, Transform},
@@ -63,10 +63,10 @@ where
     }
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
-        let api_key = req
+        let key_id = req
             .extensions()
-            .get::<ValidatedApiKey>()
-            .map(|k| k.key.clone())
+            .get::<Caller>()
+            .map(|caller| caller.key_id.to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
         let tracker = self.tracker.clone();
@@ -86,9 +86,9 @@ where
             tracker
                 .write()
                 .unwrap()
-                .record_request(&api_key, latency, is_error);
+                .record_request(&key_id, latency, is_error);
             info!(
-                api_key = %api_key,
+                key_id = %key_id,
                 latency_ms = latency,
                 is_error = is_error,
                 "Tracked request"
