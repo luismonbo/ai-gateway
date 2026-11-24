@@ -1,7 +1,10 @@
 [package]
 name = "ai-gateway"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+description = "An OpenAI-compatible gateway that routes requests to Ollama, OpenAI and other OpenAI-style backends by model prefix, with API keys, rate limits, fallback and usage stats"
+license = "Apache-2.0"
+repository = "https://github.com/LuisMongeB/ai-gateway"
 
 [dependencies]
 actix-web = "4"
