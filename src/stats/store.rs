@@ -114,14 +114,32 @@ pub enum LoadOutcome {
     },
 }
 
-/// The stats file is unusable and couldn't be moved aside either.
+/// Why the gateway can't use `STATS_PATH`; startup stops on any of these.
 #[derive(Debug, thiserror::Error)]
-#[error("stats file {} is unusable ({reason}) and could not be moved aside: {source}", .path.display())]
-pub struct StatsLoadError {
-    path: PathBuf,
-    reason: String,
-    #[source]
-    source: io::Error,
+pub enum StatsLoadError {
+    /// The file is unusable and couldn't be moved aside either.
+    #[error("stats file {} is unusable ({reason}) and could not be moved aside: {source}", .path.display())]
+    Unmovable {
+        path: PathBuf,
+        reason: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error(
+        "STATS_PATH {} is a directory; point it at a file such as {}",
+        .path.display(),
+        .path.join("stats.json").display()
+    )]
+    IsDirectory { path: PathBuf },
+    #[error(
+        "STATS_PATH {} can't be written ({source}); make its directory writable by the gateway's user",
+        .path.display()
+    )]
+    Unwritable {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 #[derive(Default)]
@@ -132,9 +150,29 @@ pub struct StatsStore {
 }
 
 impl StatsStore {
+    /// Loads `path`, then saves straight away. An unwritable `STATS_PATH`
+    /// then stops startup instead of failing every later save, and raw keys
+    /// from old files leave the disk at once.
+    pub fn open(path: &Path) -> Result<(StatsStore, LoadOutcome), StatsLoadError> {
+        let (store, outcome) = StatsStore::load(path)?;
+        store
+            .save(path)
+            .map_err(|source| StatsLoadError::Unwritable {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        Ok((store, outcome))
+    }
+
     /// Reads `path`. A missing file means starting empty; an unusable one is
-    /// renamed to `<path>.corrupt-<unix secs>` and the store starts empty.
+    /// renamed to `<path>.corrupt-<unix secs>` and the store starts empty. A
+    /// directory is an error and is left where it is.
     pub fn load(path: &Path) -> Result<(StatsStore, LoadOutcome), StatsLoadError> {
+        if path.is_dir() {
+            return Err(StatsLoadError::IsDirectory {
+                path: path.to_path_buf(),
+            });
+        }
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -267,7 +305,7 @@ fn quarantine(path: &Path, reason: String) -> Result<(StatsStore, LoadOutcome), 
             StatsStore::default(),
             LoadOutcome::Quarantined { moved_to, reason },
         )),
-        Err(source) => Err(StatsLoadError {
+        Err(source) => Err(StatsLoadError::Unmovable {
             path: path.to_path_buf(),
             reason,
             source,

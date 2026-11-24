@@ -291,3 +291,55 @@ fn distinct_labels_per_key_are_capped() {
     assert_eq!(models["primary/(other)"], 5);
     assert_eq!(models["primary/model-0"], 2);
 }
+
+#[test]
+fn a_directory_path_is_an_error_and_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stats.json");
+    fs::create_dir(&path).unwrap();
+
+    let err = StatsStore::load(&path)
+        .err()
+        .expect("a directory isn't a stats file");
+    assert!(err.to_string().contains("STATS_PATH"), "{err}");
+    assert!(path.is_dir());
+    assert_eq!(file_names(dir.path()), ["stats.json"]);
+}
+
+#[test]
+fn open_saves_at_once_so_raw_keys_leave_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stats.json");
+    fs::write(&path, r#"{"stats":{"sk-raw-secret":{"request_count":1}}}"#).unwrap();
+
+    let (store, outcome) = StatsStore::open(&path).unwrap();
+    assert_eq!(
+        outcome,
+        LoadOutcome::Loaded {
+            keys: 1,
+            rekeyed: 1
+        }
+    );
+    assert_eq!(store.get(&key("sk-raw-secret")).unwrap().request_count, 1);
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("sk-raw-secret"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn open_fails_when_stats_cannot_be_written() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+
+    // Root ignores directory permissions; there's nothing to test then.
+    let enforced = fs::write(dir.path().join("probe"), "").is_err();
+    let result = StatsStore::open(&dir.path().join("stats.json"));
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    if enforced {
+        let err = result
+            .err()
+            .expect("a read-only directory can't hold stats");
+        assert!(err.to_string().contains("STATS_PATH"), "{err}");
+    }
+}

@@ -55,7 +55,7 @@ async fn main() -> ExitCode {
 
     let stats_path = config.stats_path.clone();
     let flush_every = config.stats_flush_interval;
-    let stats = match StatsStore::load(&stats_path) {
+    let stats = match StatsStore::open(&stats_path) {
         Ok((stats, outcome)) => {
             log_load(&stats_path, &outcome);
             Arc::new(stats)
@@ -113,7 +113,7 @@ fn log_load(path: &Path, outcome: &LoadOutcome) {
             if *rekeyed > 0 {
                 warn!(
                     "{rekeyed} stats entries were stored under raw API keys; they now use \
-                     key IDs, and the raw keys leave {path} at the next save"
+                     key IDs, and {path} no longer holds the raw keys"
                 );
             }
         }
