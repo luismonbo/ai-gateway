@@ -7,7 +7,8 @@ license = "Apache-2.0"
 repository = "https://github.com/LuisMongeB/ai-gateway"
 
 [dependencies]
-actix-web = "4"
+# No default features: no request decompression, cookies or HTTP/2, none of which the gateway uses.
+actix-web = { version = "4", default-features = false, features = ["macros"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

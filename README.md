@@ -314,6 +314,7 @@ What changes for clients:
 - Tokens aren't counted for streams from an upstream that ignores `stream_options`.
 - Tokens aren't counted for a stream the client abandons before it ends.
 - A non-streaming request whose generation takes longer than `UPSTREAM_TIMEOUT_SECS` times out, because the upstream sends nothing until it's done. Stream long generations, or raise the timeout.
+- Request bodies aren't decompressed: a body sent with `Content-Encoding: gzip` gets a 400. Leaving decompression out means a small compressed body can't expand into a huge one.
 - There are no retries, response caching, embeddings endpoint or Azure OpenAI support yet.
 
 ## Development
