@@ -8,7 +8,8 @@ use ai_gateway::app::{build_app, AppState};
 use ai_gateway::config::Config;
 use ai_gateway::stats::StatsStore;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::io;
+use std::sync::{Arc, Mutex, PoisonError};
 use wiremock::MockServer;
 
 pub const USER_KEY: &str = "test-user-key-0123456789abcdef01234567";
@@ -101,4 +102,35 @@ pub fn sse_stream() -> String {
         "data: [DONE]\n\n",
     ]
     .concat()
+}
+
+/// Everything logged on this thread from now until the guard drops, at
+/// DEBUG and above, as plain text. `actix_web::test` runs a test on one
+/// thread, so the gateway's own log lines all land here.
+pub fn capture_logs() -> (tracing::subscriber::DefaultGuard, Arc<Mutex<Vec<u8>>>) {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let writer = SharedBuffer(Arc::clone(&buffer));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    (tracing::subscriber::set_default(subscriber), buffer)
+}
+
+#[derive(Clone)]
+struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for SharedBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
