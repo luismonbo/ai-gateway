@@ -32,6 +32,8 @@ fn timeouts_and_limit_have_defaults() {
     assert_eq!(config.upstream_timeout, Duration::from_secs(300));
     assert_eq!(config.max_request_bytes, 10_485_760);
     assert_eq!(config.rate_limit_rpm, 60);
+    assert_eq!(config.stats_path, std::path::PathBuf::from("stats.json"));
+    assert_eq!(config.stats_flush_interval, Duration::from_secs(60));
     assert_eq!(config.default_upstream, None);
 
     let (config, _) = load(&[
@@ -53,6 +55,7 @@ fn zero_timeouts_are_rejected() {
         "UPSTREAM_TIMEOUT_SECS",
         "MAX_REQUEST_BYTES",
         "RATE_LIMIT_RPM",
+        "STATS_FLUSH_SECS",
     ] {
         let err = load(&[("GATEWAY_API_KEYS", LONG), (name, "0")]).unwrap_err();
         assert_eq!(err.variable, name);

@@ -2,12 +2,11 @@ use actix_web::{web, HttpServer};
 use ai_gateway::app::{build_app, AppState};
 use ai_gateway::config::{Config, LogFormat};
 use ai_gateway::logging::init_logging;
-use ai_gateway::tracking::RequestTracker;
+use ai_gateway::stats::{spawn_flusher, LoadOutcome, StatsStore};
+use std::path::Path;
 use std::process::ExitCode;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::Arc;
 use tracing::{error, info, warn};
-
-const STATS_PATH: &str = "stats.json";
 
 #[actix_web::main]
 async fn main() -> ExitCode {
@@ -54,8 +53,20 @@ async fn main() -> ExitCode {
         info!("{line}");
     }
 
-    let stats = Arc::new(RwLock::new(load_stats()));
-    let state = match AppState::new(config, stats.clone()) {
+    let stats_path = config.stats_path.clone();
+    let flush_every = config.stats_flush_interval;
+    let stats = match StatsStore::load(&stats_path) {
+        Ok((stats, outcome)) => {
+            log_load(&stats_path, &outcome);
+            Arc::new(stats)
+        }
+        Err(e) => {
+            error!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let state = match AppState::new(config, Arc::clone(&stats)) {
         Ok(state) => web::Data::new(state),
         Err(e) => {
             error!("could not build the HTTP client: {e}");
@@ -74,11 +85,18 @@ async fn main() -> ExitCode {
     };
     info!("listening on http://{}:{}", address.0, address.1);
 
+    let flusher = spawn_flusher(Arc::clone(&stats), stats_path.clone(), flush_every);
     let result = server.run().await;
+    flusher.abort();
+
     info!("server stopped; saving stats");
-    save_stats(&stats);
+    let saved = stats.save(&stats_path);
+    if let Err(e) = &saved {
+        error!("could not save stats to {}: {e}", stats_path.display());
+    }
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) if saved.is_ok() => ExitCode::SUCCESS,
+        Ok(()) => ExitCode::FAILURE,
         Err(e) => {
             error!("server error: {e}");
             ExitCode::FAILURE
@@ -86,23 +104,22 @@ async fn main() -> ExitCode {
     }
 }
 
-fn load_stats() -> RequestTracker {
-    match RequestTracker::load_from_file(STATS_PATH) {
-        Ok(tracker) => {
-            info!("loaded request stats from {STATS_PATH}");
-            tracker
+fn log_load(path: &Path, outcome: &LoadOutcome) {
+    let path = path.display();
+    match outcome {
+        LoadOutcome::Missing => info!("no stats file at {path}; starting empty"),
+        LoadOutcome::Loaded { keys, rekeyed } => {
+            info!("loaded stats for {keys} keys from {path}");
+            if *rekeyed > 0 {
+                warn!(
+                    "{rekeyed} stats entries were stored under raw API keys; they now use \
+                     key IDs, and the raw keys leave {path} at the next save"
+                );
+            }
         }
-        Err(_) => {
-            info!("no existing stats found, starting fresh");
-            RequestTracker::new()
-        }
-    }
-}
-
-fn save_stats(stats: &RwLock<RequestTracker>) {
-    let tracker = stats.read().unwrap_or_else(PoisonError::into_inner);
-    match tracker.save_to_file(STATS_PATH) {
-        Ok(()) => info!("saved request stats to {STATS_PATH}"),
-        Err(e) => error!("could not save request stats: {e}"),
+        LoadOutcome::Quarantined { moved_to, reason } => error!(
+            "stats file {path} was unusable ({reason}); moved it to {} and starting empty",
+            moved_to.display()
+        ),
     }
 }

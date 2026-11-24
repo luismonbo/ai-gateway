@@ -7,12 +7,11 @@ use super::upstream::{
     self, describe_failure, failure_response, read_body, send_chat, should_fallback,
     UpstreamFailure,
 };
-use super::usage::{probe, Usage};
+use super::usage::probe;
 use crate::app::AppState;
-use crate::auth::{Caller, KeyId};
+use crate::auth::Caller;
 use crate::config::{FallbackTarget, Upstream};
 use crate::error::ApiError;
-use crate::tracking::RequestTracker;
 use actix_web::error::PayloadError;
 use actix_web::http::header::{HeaderName, HeaderValue, CACHE_CONTROL, CONTENT_TYPE};
 use actix_web::http::StatusCode;
@@ -20,7 +19,7 @@ use actix_web::{web, HttpResponse};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 /// Names the upstream that handled the request, on every response that
@@ -237,8 +236,8 @@ async fn attempt(
     })
 }
 
-/// Relays a successful answer and records its token usage under
-/// `"{upstream}/{model}"`, preferring the model the upstream reported.
+/// Relays a successful answer and records it under `"{upstream}/{model}"`,
+/// preferring the model the upstream reported, with its tokens if any.
 fn success_response(
     state: &web::Data<AppState>,
     caller: &Caller,
@@ -253,13 +252,12 @@ fn success_response(
             content_type,
             body,
         } => {
-            if let Some(found) = probe(&body) {
-                let model = found.model.as_deref().unwrap_or(model_sent);
-                if let Some(usage) = found.usage {
-                    let label = model_label(&upstream.name, model);
-                    record_usage(&state.stats, &caller.key_id, &label, usage);
-                }
-            }
+            let found = probe(&body).unwrap_or_default();
+            let model = found.model.as_deref().unwrap_or(model_sent);
+            let label = model_label(&upstream.name, model);
+            state
+                .stats
+                .record_completion(&caller.key_id, &label, found.usage);
             let content_type =
                 content_type.unwrap_or_else(|| HeaderValue::from_static("application/json"));
             HttpResponse::build(status)
@@ -272,11 +270,9 @@ fn success_response(
             let upstream_name = upstream.name.clone();
             let model_sent = model_sent.to_string();
             let on_finish = move |summary: StreamSummary| {
-                if let Some(usage) = summary.usage {
-                    let model = summary.model.unwrap_or(model_sent);
-                    let label = model_label(&upstream_name, &model);
-                    record_usage(&stats, &key_id, &label, usage);
-                }
+                let model = summary.model.unwrap_or(model_sent);
+                let label = model_label(&upstream_name, &model);
+                stats.record_completion(&key_id, &label, summary.usage);
             };
             let events = relay_sse(
                 response.bytes_stream(),
@@ -293,18 +289,6 @@ fn success_response(
 
 fn model_label(upstream: &str, model: &str) -> String {
     format!("{upstream}/{model}")
-}
-
-fn record_usage(stats: &RwLock<RequestTracker>, key_id: &KeyId, model: &str, usage: Usage) {
-    stats
-        .write()
-        .unwrap_or_else(PoisonError::into_inner)
-        .record_tokens(
-            key_id.as_str(),
-            usage.prompt_tokens,
-            usage.completion_tokens,
-            model,
-        );
 }
 
 /// Adds a header, unless `value` can't be one (names and models are plain

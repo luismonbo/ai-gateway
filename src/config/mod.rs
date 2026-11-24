@@ -10,6 +10,7 @@ pub use upstreams::{FallbackTarget, Upstream, UpstreamKey};
 
 use crate::auth::{KeyId, KeyStore, KeyStoreError, Role};
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -18,6 +19,7 @@ const DEFAULT_PORT: u16 = 8080;
 /// 10 MiB.
 const DEFAULT_MAX_REQUEST_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_RATE_LIMIT_RPM: u32 = 60;
+const DEFAULT_STATS_PATH: &str = "stats.json";
 const USER_KEYS: &str = "GATEWAY_API_KEYS";
 const ADMIN_KEYS: &str = "ADMIN_API_KEYS";
 /// Keys shorter than this get a startup warning.
@@ -45,6 +47,9 @@ pub struct Config {
     pub max_request_bytes: usize,
     /// Requests per minute per key; also the burst size.
     pub rate_limit_rpm: u32,
+    pub stats_path: PathBuf,
+    /// How often stats are saved, besides at shutdown.
+    pub stats_flush_interval: Duration,
 }
 
 /// A configuration rule that was broken, and the variable that broke it.
@@ -86,6 +91,11 @@ impl Config {
         let upstream_timeout = seconds(&env, "UPSTREAM_TIMEOUT_SECS", 300)?;
         let max_request_bytes = positive(&env, "MAX_REQUEST_BYTES", DEFAULT_MAX_REQUEST_BYTES)?;
         let rate_limit_rpm = positive(&env, "RATE_LIMIT_RPM", DEFAULT_RATE_LIMIT_RPM)?;
+        let stats_path = PathBuf::from(
+            env.get("STATS_PATH")
+                .unwrap_or_else(|| DEFAULT_STATS_PATH.to_string()),
+        );
+        let stats_flush_interval = seconds(&env, "STATS_FLUSH_SECS", 60)?;
 
         let config = Config {
             host,
@@ -98,6 +108,8 @@ impl Config {
             upstream_timeout,
             max_request_bytes,
             rate_limit_rpm,
+            stats_path,
+            stats_flush_interval,
         };
         let warnings = [key_warnings, upstream_warnings, legacy_warnings(&env)].concat();
         Ok((config, warnings))
@@ -149,6 +161,11 @@ impl Config {
             "rate limit: {} requests per minute per key",
             self.rate_limit_rpm
         );
+        let stats = format!(
+            "stats: saved to {} every {} s and at shutdown",
+            self.stats_path.display(),
+            self.stats_flush_interval.as_secs()
+        );
         let keys = format!(
             "API keys: {} user, {} admin",
             self.keys.count(Role::User),
@@ -156,7 +173,7 @@ impl Config {
         );
         std::iter::once(address)
             .chain(upstreams)
-            .chain([default_upstream, limits, rate_limit, keys])
+            .chain([default_upstream, limits, rate_limit, stats, keys])
             .collect()
     }
 }

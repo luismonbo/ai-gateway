@@ -6,9 +6,9 @@ use actix_web::dev::{Service, ServiceResponse};
 use actix_web::{test, web};
 use ai_gateway::app::{build_app, AppState};
 use ai_gateway::config::Config;
-use ai_gateway::tracking::RequestTracker;
+use ai_gateway::stats::StatsStore;
 use serde_json::{json, Value};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use wiremock::MockServer;
 
 pub const USER_KEY: &str = "test-user-key-0123456789abcdef01234567";
@@ -47,8 +47,7 @@ pub fn config(overrides: &[(&str, &str)]) -> Config {
 }
 
 pub fn state(config: Config) -> AppState {
-    AppState::new(config, Arc::new(RwLock::new(RequestTracker::new())))
-        .expect("the HTTP client builds")
+    AppState::new(config, Arc::new(StatsStore::default())).expect("the HTTP client builds")
 }
 
 /// The whole app, in-process, ready for `test::call_service`.
