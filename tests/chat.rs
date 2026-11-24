@@ -339,3 +339,29 @@ async fn unprefixed_model_goes_to_the_default() {
     assert_eq!(response.status(), 200);
     assert_eq!(received_bodies(&server).await[0]["model"], "m1");
 }
+
+#[actix_web::test]
+async fn forwards_json_keys_in_their_original_order() {
+    let server = upstream(ok_json(json!({"model": "m1", "choices": []}))).await;
+    let url = mock_url(&server);
+    let app = init(state(config(&[("PRIMARY_BASE_URL", &url)]))).await;
+    // Structured outputs are generated in schema order: reasoning first.
+    let body = r#"{"model":"primary/m1","messages":[{"role":"user","content":"hi"}],
+        "response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":{
+        "type":"object","properties":{"reasoning":{"type":"string"},"final_answer":{"type":"string"}},
+        "required":["reasoning","final_answer"]}}}}"#;
+    let request = TestRequest::post()
+        .uri(CHAT)
+        .insert_header(bearer(USER_KEY))
+        .insert_header(("content-type", "application/json"))
+        .set_payload(body)
+        .to_request();
+
+    assert_eq!(test::call_service(&app, request).await.status(), 200);
+    let requests = server.received_requests().await.unwrap();
+    let sent = String::from_utf8_lossy(&requests[0].body);
+    assert!(
+        sent.contains(r#""properties":{"reasoning":"#),
+        "keys were reordered: {sent}"
+    );
+}
