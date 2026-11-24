@@ -4,12 +4,13 @@
 use super::routing::resolve_route;
 use super::sse::{relay_sse, with_include_usage, StreamInspector, StreamSummary};
 use super::upstream::{
-    self, describe_failure, failure_response, read_body, send_chat, UpstreamFailure,
+    self, describe_failure, failure_response, read_body, send_chat, should_fallback,
+    UpstreamFailure,
 };
 use super::usage::{probe, Usage};
 use crate::app::AppState;
 use crate::auth::{Caller, KeyId};
-use crate::config::Upstream;
+use crate::config::{FallbackTarget, Upstream};
 use crate::error::ApiError;
 use crate::tracking::RequestTracker;
 use actix_web::error::PayloadError;
@@ -25,6 +26,8 @@ use tracing::{debug, warn};
 /// Names the upstream that handled the request, on every response that
 /// reached one.
 const UPSTREAM_HEADER: &str = "x-gateway-upstream";
+/// `upstream/model` of the fallback, when the fallback handled the request.
+const FALLBACK_HEADER: &str = "x-gateway-fallback";
 
 /// A chat request as the client sent it. Only `model` and `stream` are read;
 /// every other field is kept as-is in `rest` and forwarded unchanged.
@@ -82,21 +85,91 @@ pub async fn chat_completions(
 
     let stream = request.stream == Some(true);
     let body = upstream_body(&request, route.model);
-    let response = match attempt(&state, upstream, body, stream).await {
+    let failure = match attempt(&state, upstream, body, stream).await {
         Ok(attempt) => {
-            success_response(&state, &caller, upstream, route.model, attempt, strip_usage)
+            let response =
+                success_response(&state, &caller, upstream, route.model, attempt, strip_usage);
+            return Ok(with_header(response, UPSTREAM_HEADER, &upstream.name));
         }
-        Err(failure) => {
+        Err(failure) => failure,
+    };
+
+    let target = upstream
+        .fallback
+        .as_ref()
+        .filter(|_| should_fallback(&failure));
+    let response = match target {
+        Some(target) => {
+            fall_back(
+                &state,
+                &caller,
+                &request,
+                upstream,
+                &failure,
+                target,
+                strip_usage,
+            )
+            .await
+        }
+        None => {
             warn!(
                 key_id = %caller.key_id,
                 upstream = %upstream.name,
                 error = %describe_failure(upstream, &failure),
                 "upstream request failed"
             );
-            failure_response(&upstream.name, &failure)
+            with_header(
+                failure_response(&upstream.name, &failure),
+                UPSTREAM_HEADER,
+                &upstream.name,
+            )
         }
     };
-    Ok(with_upstream_header(response, &upstream.name))
+    Ok(response)
+}
+
+/// Sends the request once more, to the primary's fallback target, before
+/// any byte has reached the client. The target's own fallback is never
+/// followed. Whatever the target answers carries `x-gateway-fallback`.
+async fn fall_back(
+    state: &web::Data<AppState>,
+    caller: &Caller,
+    request: &ChatRequest,
+    primary: &Upstream,
+    primary_failure: &UpstreamFailure,
+    target: &FallbackTarget,
+    strip_usage: bool,
+) -> HttpResponse {
+    let primary_error = describe_failure(primary, primary_failure);
+    warn!(
+        key_id = %caller.key_id,
+        primary = %primary.name,
+        error = %primary_error,
+        fallback = %target,
+        "primary upstream failed; using fallback"
+    );
+    let backup = state
+        .config
+        .upstream(&target.upstream)
+        .expect("config only accepts fallbacks to configured upstreams");
+    let body = upstream_body(request, &target.model);
+    let stream = request.stream == Some(true);
+    let response = match attempt(state, backup, body, stream).await {
+        Ok(attempt) => success_response(state, caller, backup, &target.model, attempt, strip_usage),
+        Err(failure) => {
+            warn!(
+                key_id = %caller.key_id,
+                primary = %primary.name,
+                primary_error = %primary_error,
+                fallback = %target,
+                error = %describe_failure(backup, &failure),
+                "fallback upstream failed too"
+            );
+            failure_response(&backup.name, &failure)
+        }
+    };
+    let response = with_header(response, UPSTREAM_HEADER, &backup.name);
+    with_header(response, FALLBACK_HEADER, &target.to_string())
 }
 
 fn body_error(error: &actix_web::Error, limit: usize) -> ApiError {
@@ -234,13 +307,15 @@ fn record_usage(stats: &RwLock<RequestTracker>, key_id: &KeyId, model: &str, usa
         );
 }
 
-fn with_upstream_header(response: HttpResponse, upstream: &str) -> HttpResponse {
-    let Ok(value) = HeaderValue::from_str(upstream) else {
+/// Adds a header, unless `value` can't be one (names and models are plain
+/// text, so in practice it always can).
+fn with_header(response: HttpResponse, name: &'static str, value: &str) -> HttpResponse {
+    let Ok(value) = HeaderValue::from_str(value) else {
         return response;
     };
     let mut response = response;
     response
         .headers_mut()
-        .insert(HeaderName::from_static(UPSTREAM_HEADER), value);
+        .insert(HeaderName::from_static(name), value);
     response
 }
