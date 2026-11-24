@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/LuisMongeB/ai-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/LuisMongeB/ai-gateway/actions/workflows/ci.yml)
 
-An OpenAI-compatible gateway that routes requests to Ollama, OpenAI and other OpenAI-style backends by model prefix, with API keys, rate limits, fallback and usage stats. Clients talk to one endpoint and pick a backend with a prefix such as `ollama/gemma4:e2b` or `openai/gpt-6-terra`. Request and response bodies pass through untouched apart from the model name, so tools, images, JSON mode, sampling parameters and streaming work wherever the backend supports them. It is written in Rust with actix-web and runs as a single binary or a small Docker image.
+An OpenAI-compatible gateway that routes requests to Ollama, OpenAI and other OpenAI-style backends by model prefix, with API keys, rate limits, fallback and usage stats. Clients talk to one endpoint and pick a backend with a prefix such as `ollama/gemma4:e2b` or `openai/gpt-6-terra`. Requests are forwarded with only the model name rewritten (streaming requests also get usage reporting switched on), and answers come back byte for byte, so tools, images, JSON mode, sampling parameters and streaming work wherever the backend supports them. It is written in Rust with actix-web and runs as a single binary or a small Docker image.
 
 ## Quick start
 
@@ -14,7 +14,7 @@ openssl rand -hex 32          # put the output in .env as GATEWAY_API_KEYS=…
 cargo run --release
 ```
 
-The gateway reads `.env` from the current directory at startup; variables already set in the environment win. The examples below send the key as `$GATEWAY_KEY`, so set that first (`export GATEWAY_KEY=…`, the same key). Check that the gateway is up, then send a request:
+At startup the gateway reads the first `.env` it finds in the current directory or one of its parents; variables already set in the environment win. The examples below send the key as `$GATEWAY_KEY`, so set that first (`export GATEWAY_KEY=…`, the same key). Check that the gateway is up, then send a request:
 
 ```bash
 curl http://localhost:8080/health
@@ -50,7 +50,8 @@ docker run --rm -p 8080:8080 -v ai-gateway-data:/data \
 
 - Inside a container, `localhost` is the container itself. `host.docker.internal` reaches an Ollama running on your machine; on Linux, add `--add-host=host.docker.internal:host-gateway`.
 - The image sets `HOST=0.0.0.0`, `PORT=8080` and `STATS_PATH=/data/stats.json`. If you pass `--env-file .env`, keep `HOST` and `STATS_PATH` out of that file, or the container stops listening on its network interface or can't save stats.
-- The image runs as the non-root user 65532 and keeps stats in the `/data` volume, which that user owns.
+- The image runs as the non-root user 65532 and keeps stats in `/data`. A named volume starts out owned by that user. For a bind mount (`-v ./data:/data`), make the directory writable by it first (`sudo chown 65532:65532 ./data`). If `STATS_PATH` can't be written, the gateway refuses to start and says why.
+- `docker stop` kills the container after 10 s, but the gateway waits up to 30 s for requests still in flight. If streams may be running when you stop it, allow more time (`docker stop -t 35`, Compose `stop_grace_period: 35s`, Kubernetes `terminationGracePeriodSeconds: 35`), or the final stats save is cut off.
 - The image has no shell or curl, so a `HEALTHCHECK` command can't run inside it. Probe `/health` over HTTP instead, for example in Kubernetes:
 
 ```yaml
@@ -148,7 +149,7 @@ curl http://localhost:8080/health
 
 ### `POST /v1/chat/completions`
 
-The OpenAI chat completions API. Only `model` is rewritten; every other field reaches the upstream unchanged, and only the upstream's own key is sent to it, never the client's gateway key.
+The OpenAI chat completions API. Only `model` is rewritten, and streaming requests may gain `stream_options` (see below). The other fields reach the upstream with the same values and in the same order (`"stream": null` is left out, which means the same). Only the upstream's own key is sent to it, never the client's gateway key.
 
 ```bash
 curl http://localhost:8080/v1/chat/completions \
@@ -177,7 +178,7 @@ Chat responses that reached an upstream, successful or not, carry these headers:
 | Header | Value |
 |---|---|
 | `x-gateway-upstream` | The upstream that answered, e.g. `ollama`. |
-| `x-gateway-fallback` | `upstream/model` of the fallback, only when the fallback answered. |
+| `x-gateway-fallback` | `upstream/model` of the fallback, when the request went to the fallback, whether it succeeded or failed. |
 
 ### `GET /v1/models`
 
@@ -254,7 +255,7 @@ Every error the gateway produces uses OpenAI's format, so the SDKs report it lik
 | Upstream 401 or 403 | 502, generic message | `server_error` | `upstream_auth_failed` |
 | Any other upstream 4xx (400, 404, 413, 422…) | the same status | the upstream's own body, passed through | |
 
-Bodies of upstream 401, 403, 429 and 5xx responses are never returned, because they can contain fragments of the operator's upstream key or organisation ID. They're logged, truncated to 512 bytes, with the upstream's key replaced by `[redacted]`. Other 4xx bodies reach the client because they explain the client's mistake, such as an unknown model or a context that's too long.
+Bodies of upstream 401, 403, 429 and 5xx responses are never returned, because they can contain fragments of the operator's upstream key or organisation ID. They're logged, truncated to 512 bytes, with the upstream's key replaced by `[redacted]` and line breaks escaped so each stays on one log line. Other 4xx bodies reach the client because they explain the client's mistake, such as an unknown model or a context that's too long; if one ever contains the upstream's key, the key is replaced by `[redacted]` first.
 
 If an upstream fails in the middle of a stream, the status has already been sent, so the gateway logs the failure and aborts the connection instead of ending the stream as if the answer were complete.
 
@@ -265,20 +266,21 @@ For each key ID the gateway records:
 - requests and errors (responses with a 5xx status);
 - latency to the response headers;
 - prompt and completion tokens;
-- which models answered, as `upstream/model`, so a fallback shows up as `openai/gpt-6-terra`.
+- which models answered, as `upstream/model`, so a fallback shows up as `openai/gpt-6-terra`. Labels are cut at 256 bytes, and each key keeps at most 100; answers from further models count under `upstream/(other)`.
 
-Stats are saved to `STATS_PATH` every `STATS_FLUSH_SECS` and on shutdown, so a crash loses at most one interval. Each save writes `<path>.tmp`, syncs it to disk and renames it over the old file, so the file is never half-written. If the final save fails, the gateway exits with status 1.
+At startup the file is loaded and saved straight away, so an unwritable `STATS_PATH` stops the gateway before it serves anything. After that, stats are saved every `STATS_FLUSH_SECS` and on shutdown, so a crash loses at most one interval. Each save writes `<path>.tmp`, syncs it to disk and renames it over the old file, so the file is never half-written. If the final save fails, the gateway exits with status 1.
 
 - **Missing file:** the gateway starts empty.
 - **Corrupt or unreadable file:** it's logged as an error and renamed to `<path>.corrupt-<unix time>`, and the gateway starts empty. Nothing is overwritten. If the file can't be renamed either, startup fails.
-- **Files from 0.1:** entries stored under raw API keys are re-keyed to their key IDs and merged when the file loads, and the raw keys leave the file at the next save.
+- **A directory:** startup fails, and the directory is left alone; point `STATS_PATH` at a file.
+- **Files from 0.1:** entries stored under raw API keys are re-keyed to their key IDs and merged when the file loads, and the startup save removes the raw keys from the file.
 
 ## Logging
 
 - **Library:** logs go through `tracing`, as text or as JSON lines (`LOG_FORMAT=json`), and are filtered with `RUST_LOG`.
 - **Colours:** text logs use colour only when they go to a terminal and `NO_COLOR` isn't set.
-- **Access log:** every request gets one line with target `access`, holding the method, the path, the status, the latency, the client's IP address and the user agent. The query string is never logged. Quiet the access log with `RUST_LOG=info,access=warn`.
-- **Key IDs:** gateway log lines name keys by ID (`key_id` field). No raw key, gateway or upstream, appears in logs, stats or error responses.
+- **Access log:** every request gets one line with target `access`, holding the method, the path, the status, the latency, the IP address of the TCP peer (your reverse proxy's, if one sits in front) and the user agent. The query string is never logged. Quiet the access log with `RUST_LOG=info,access=warn`.
+- **Key IDs:** gateway log lines name keys by ID (`key_id` field). No raw key, gateway or upstream, is written to logs or stats, and an upstream's key is replaced by `[redacted]` in any upstream body the gateway logs or passes on.
 
 ## Upgrading from 0.1
 
@@ -301,7 +303,7 @@ Also:
 What changes for clients:
 
 - **Model names:** they take an upstream prefix (`ollama/gemma4:e2b`). With `DEFAULT_UPSTREAM=ollama`, unprefixed names keep going to Ollama.
-- **Request bodies:** they now pass through to the upstream unchanged. Ollama-only options that the old translation layer handled, such as a per-request `num_ctx`, are no longer available.
+- **Request bodies:** they now reach the upstream as sent, with only `model` rewritten. Ollama-only options that the old translation layer handled, such as a per-request `num_ctx`, are no longer available.
 - **Health check:** `/v1/health` is now `/health`, and it needs no key.
 - **Stats:** `/v1/stats` returns `key_id` instead of `api_key`, and admins filter with `?key_id=` instead of `?key=`.
 - **Errors:** they use OpenAI's format, and rate-limited requests get a `Retry-After` header.
@@ -314,6 +316,8 @@ What changes for clients:
 - Tokens aren't counted for streams from an upstream that ignores `stream_options`.
 - Tokens aren't counted for a stream the client abandons before it ends.
 - A non-streaming request whose generation takes longer than `UPSTREAM_TIMEOUT_SECS` times out, because the upstream sends nothing until it's done. Stream long generations, or raise the timeout.
+- An upstream that rejects unknown request fields refuses streaming requests that don't ask for usage, because the gateway adds `stream_options.include_usage` to them.
+- HTTPS upstreams need a certificate from a public certificate authority. The gateway trusts Mozilla's bundled root certificates, not the system's, so a private CA isn't accepted yet.
 - Request bodies aren't decompressed: a body sent with `Content-Encoding: gzip` gets a 400. Leaving decompression out means a small compressed body can't expand into a huge one.
 - There are no retries, response caching, embeddings endpoint or Azure OpenAI support yet.
 

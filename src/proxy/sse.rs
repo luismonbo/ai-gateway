@@ -11,8 +11,9 @@ use serde_json::{Map, Value};
 use std::fmt;
 use tracing::warn;
 
-/// A buffer this big without a complete event is passed on uninspected, so
-/// an upstream that never sends a blank line can't grow it without limit.
+/// A buffer this big without a complete event is passed on as it is (the
+/// inspector can't parse a partial event, so it's forwarded), so an upstream
+/// that never sends a blank line can't grow the buffer without limit.
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
 const STREAM_OPTIONS: &str = "stream_options";
 const INCLUDE_USAGE: &str = "include_usage";
