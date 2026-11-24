@@ -1,5 +1,6 @@
 //! The actix application: shared state, routes and middleware order.
 
+use crate::access_log::access_log;
 use crate::auth::require_api_key;
 use crate::config::Config;
 use crate::error::ApiError;
@@ -10,7 +11,7 @@ use crate::rate_limit::{enforce_rate_limit, RateLimiter};
 use crate::stats::{get_stats, track_request, StatsStore};
 use actix_web::body::MessageBody;
 use actix_web::dev::{ServiceFactory, ServiceRequest, ServiceResponse};
-use actix_web::middleware::{from_fn, Logger};
+use actix_web::middleware::from_fn;
 use actix_web::{web, App, HttpRequest, HttpResponse, ResponseError};
 use std::sync::Arc;
 
@@ -37,7 +38,7 @@ impl AppState {
 }
 
 /// Builds the app. `.wrap` calls run in reverse order, so inside `/v1` a
-/// request passes Auth → RateLimit → Tracking → handler, and the `Logger`
+/// request passes Auth → RateLimit → Tracking → handler, and the access log
 /// around everything also records requests that Auth or RateLimit reject.
 pub fn build_app(
     state: web::Data<AppState>,
@@ -54,7 +55,7 @@ pub fn build_app(
         .app_data(state.clone())
         // Body extractors read at most this much; larger bodies get a 413.
         .app_data(web::PayloadConfig::new(state.config.max_request_bytes))
-        .wrap(Logger::default())
+        .wrap(from_fn(access_log))
         .route("/health", web::get().to(health))
         .service(
             web::scope("/v1")
