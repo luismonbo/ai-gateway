@@ -3,9 +3,10 @@
 use crate::auth::require_api_key;
 use crate::config::Config;
 use crate::error::ApiError;
-use crate::handlers::{chat_completions, get_stats};
+use crate::handlers::get_stats;
 use crate::middleware::{RateLimitMiddleware, RateLimiter, TrackingMiddleware};
-use crate::providers::LLMProvider;
+use crate::proxy::chat::chat_completions;
+use crate::proxy::upstream::build_http_client;
 use crate::tracking::RequestTracker;
 use actix_web::body::MessageBody;
 use actix_web::dev::{ServiceFactory, ServiceRequest, ServiceResponse};
@@ -16,9 +17,22 @@ use std::sync::{Arc, RwLock};
 /// Everything the handlers share, built once at startup.
 pub struct AppState {
     pub config: Config,
+    /// One client for every upstream request, so connections are reused.
+    pub http: reqwest::Client,
     pub stats: Arc<RwLock<RequestTracker>>,
     pub limiter: Arc<RateLimiter>,
-    pub provider: Arc<dyn LLMProvider>,
+}
+
+impl AppState {
+    pub fn new(config: Config, stats: Arc<RwLock<RequestTracker>>) -> reqwest::Result<AppState> {
+        let http = build_http_client(&config)?;
+        Ok(AppState {
+            config,
+            http,
+            stats,
+            limiter: Arc::new(RateLimiter::new(60)),
+        })
+    }
 }
 
 /// Builds the app. `.wrap` calls run in reverse order, so inside `/v1` a
@@ -37,9 +51,10 @@ pub fn build_app(
 > {
     App::new()
         .app_data(state.clone())
-        // The legacy handlers read these directly until their replacements land.
+        // The legacy stats handler reads the tracker directly until Task 14.
         .app_data(web::Data::from(state.stats.clone()))
-        .app_data(web::Data::from(state.provider.clone()))
+        // Body extractors read at most this much; larger bodies get a 413.
+        .app_data(web::PayloadConfig::new(state.config.max_request_bytes))
         .wrap(Logger::default())
         .route("/health", web::get().to(health))
         .service(

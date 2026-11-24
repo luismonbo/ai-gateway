@@ -1,14 +1,8 @@
 use actix_web::{web, HttpServer};
 use ai_gateway::app::{build_app, AppState};
-use ai_gateway::auth::Role;
 use ai_gateway::config::{Config, LogFormat};
 use ai_gateway::logging::init_logging;
-use ai_gateway::middleware::RateLimiter;
-use ai_gateway::providers::{
-    ollama::OllamaProvider, openai::OpenAIProvider, FallbackProvider, LLMProvider,
-};
 use ai_gateway::tracking::RequestTracker;
-use std::env;
 use std::process::ExitCode;
 use std::sync::{Arc, PoisonError, RwLock};
 use tracing::{error, info, warn};
@@ -56,19 +50,18 @@ async fn main() -> ExitCode {
     for warning in &warnings {
         warn!("{warning}");
     }
-    info!(
-        user_keys = config.keys.count(Role::User),
-        admin_keys = config.keys.count(Role::Admin),
-        "API keys loaded"
-    );
+    for line in config.summary_lines() {
+        info!("{line}");
+    }
 
     let stats = Arc::new(RwLock::new(load_stats()));
-    let state = web::Data::new(AppState {
-        config,
-        stats: stats.clone(),
-        limiter: Arc::new(RateLimiter::new(60)),
-        provider: legacy_provider(),
-    });
+    let state = match AppState::new(config, stats.clone()) {
+        Ok(state) => web::Data::new(state),
+        Err(e) => {
+            error!("could not build the HTTP client: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let address = (state.config.host.clone(), state.config.port);
     let server = HttpServer::new(move || build_app(state.clone())).bind(address.clone());
@@ -90,22 +83,6 @@ async fn main() -> ExitCode {
             error!("server error: {e}");
             ExitCode::FAILURE
         }
-    }
-}
-
-/// Today's Ollama-first provider with an OpenAI fallback. Replaced by
-/// configured upstreams later in this branch.
-fn legacy_provider() -> Arc<dyn LLMProvider> {
-    let ollama = Arc::new(OllamaProvider::new(
-        env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://localhost:11434".to_string()),
-    ));
-    match (env::var("OPENAI_API_KEY"), env::var("OPENAI_BASE_URL")) {
-        (Ok(key), Ok(url)) => Arc::new(FallbackProvider::new(
-            ollama,
-            Arc::new(OpenAIProvider::new(url, key)),
-            Some("gpt-4.1-nano".to_string()),
-        )),
-        _ => ollama,
     }
 }
 

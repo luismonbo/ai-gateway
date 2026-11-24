@@ -209,9 +209,7 @@ fn error_chain(error: &(dyn Error + 'static)) -> String {
 }
 
 async fn status_failure(upstream: &str, response: reqwest::Response) -> UpstreamFailure {
-    // reqwest's StatusCode is always 100..=999, which from_u16 accepts.
-    let status =
-        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status = status(&response);
     let retry_after = header(&response, reqwest::header::RETRY_AFTER);
     let content_type = header(&response, reqwest::header::CONTENT_TYPE);
     let body = response.bytes().await.unwrap_or_else(|e| {
@@ -232,8 +230,17 @@ async fn status_failure(upstream: &str, response: reqwest::Response) -> Upstream
     }
 }
 
+/// The response's status, converted to actix's `StatusCode`.
+pub(super) fn status(response: &reqwest::Response) -> StatusCode {
+    // reqwest's StatusCode is always 100..=999, which from_u16 accepts.
+    StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY)
+}
+
 /// A response header, converted to actix's `HeaderValue`.
-fn header(response: &reqwest::Response, name: reqwest::header::HeaderName) -> Option<HeaderValue> {
+pub(super) fn header(
+    response: &reqwest::Response,
+    name: reqwest::header::HeaderName,
+) -> Option<HeaderValue> {
     response
         .headers()
         .get(name)

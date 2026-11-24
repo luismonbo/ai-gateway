@@ -6,17 +6,23 @@ use actix_web::dev::{Service, ServiceResponse};
 use actix_web::{test, web};
 use ai_gateway::app::{build_app, AppState};
 use ai_gateway::config::Config;
-use ai_gateway::middleware::RateLimiter;
-use ai_gateway::providers::ollama::OllamaProvider;
 use ai_gateway::tracking::RequestTracker;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::{Arc, RwLock};
+use wiremock::MockServer;
 
 pub const USER_KEY: &str = "test-user-key-0123456789abcdef01234567";
 pub const ADMIN_KEY: &str = "test-admin-key-0123456789abcdef0123456";
+/// The key the gateway sends to the `primary` mock when a test sets it.
+pub const UPSTREAM_KEY: &str = "sk-test-upstream-key-0123456789abcdef";
 
 /// Nothing listens on port 9, so a request that reaches it fails to connect.
 pub const UNREACHABLE_URL: &str = "http://127.0.0.1:9/v1";
+
+/// The usage-only chunk an upstream sends last when asked for usage.
+pub const USAGE_EVENT: &str = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\
+    \"model\":\"m1\",\"choices\":[],\
+    \"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n";
 
 /// A valid config: the two test keys and two upstreams, `primary` and
 /// `backup`, plus `overrides`. An override wins over a base value, and
@@ -41,13 +47,8 @@ pub fn config(overrides: &[(&str, &str)]) -> Config {
 }
 
 pub fn state(config: Config) -> AppState {
-    AppState {
-        config,
-        stats: Arc::new(RwLock::new(RequestTracker::new())),
-        limiter: Arc::new(RateLimiter::new(60)),
-        // Nothing listens on port 9; no test reaches the legacy provider.
-        provider: Arc::new(OllamaProvider::new("http://127.0.0.1:9".to_string())),
-    }
+    AppState::new(config, Arc::new(RwLock::new(RequestTracker::new())))
+        .expect("the HTTP client builds")
 }
 
 /// The whole app, in-process, ready for `test::call_service`.
@@ -68,4 +69,37 @@ pub fn bearer(key: &str) -> (&'static str, String) {
 pub async fn json_body<B: MessageBody>(response: ServiceResponse<B>) -> Value {
     let bytes = test::read_body(response).await;
     serde_json::from_slice(&bytes).expect("the response body is JSON")
+}
+
+/// A URL where nothing listens: the port was free a moment ago.
+pub fn closed_port_url() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    let port = listener.local_addr().expect("a bound address").port();
+    drop(listener);
+    format!("http://127.0.0.1:{port}/v1")
+}
+
+/// The base URL for an upstream served by `server`.
+pub fn mock_url(server: &MockServer) -> String {
+    format!("{}/v1", server.uri())
+}
+
+/// A minimal chat request for `model`.
+pub fn chat_body(model: &str) -> Value {
+    json!({"model": model, "messages": [{"role": "user", "content": "Hello"}]})
+}
+
+/// A whole streamed answer: a content event, a stop event, [`USAGE_EVENT`]
+/// and the `[DONE]` marker.
+pub fn sse_stream() -> String {
+    [
+        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m1\",\
+         \"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\
+         \"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m1\",\
+         \"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        USAGE_EVENT,
+        "data: [DONE]\n\n",
+    ]
+    .concat()
 }
