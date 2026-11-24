@@ -1,6 +1,6 @@
 //! Picks the upstream for a request from its `model` field.
 //!
-//! `ollama/gemma4:e2b` goes to the `ollama` upstream as `gemma4:e2b`. A model
+//! `ollama/<model>` goes to the `ollama` upstream as `<model>`. A model
 //! without a known prefix goes, unchanged, to `DEFAULT_UPSTREAM` if one is set.
 
 /// Where a request goes, and the model name that upstream should see.

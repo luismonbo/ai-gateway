@@ -192,3 +192,17 @@ fn upstream_key_is_redacted_in_debug_and_summary() {
     assert!(!summary.contains(secret), "{summary}");
     assert!(summary.contains(OPENAI_URL), "{summary}");
 }
+
+#[test]
+fn fallback_errors_name_no_model() {
+    // Model names go stale; the owner keeps them out of the code.
+    let err = load(&[
+        ("UPSTREAMS", "ollama,openai"),
+        ("OLLAMA_BASE_URL", OLLAMA_URL),
+        ("OPENAI_BASE_URL", OPENAI_URL),
+        ("OLLAMA_FALLBACK", "openai"),
+    ])
+    .unwrap_err();
+    assert!(err.message.contains("<upstream>/<model>"), "{err}");
+    assert!(!err.message.contains("gpt"), "names a model: {err}");
+}

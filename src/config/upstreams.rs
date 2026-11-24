@@ -192,7 +192,7 @@ fn fallback(
     let (upstream, model) = raw.split_once('/').ok_or_else(|| {
         ConfigError::new(
             variable,
-            format!("{raw:?} must be <upstream>/<model>, e.g. openai/gpt-6-terra"),
+            format!("{raw:?} must be <upstream>/<model>, e.g. openai/<model>"),
         )
     })?;
     if !names.iter().any(|name| name == upstream) {
