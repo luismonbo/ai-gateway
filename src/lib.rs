@@ -7,4 +7,5 @@ pub mod logging;
 pub mod middleware;
 pub mod models;
 pub mod providers;
+pub mod proxy;
 pub mod tracking;
