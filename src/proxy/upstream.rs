@@ -12,6 +12,7 @@ use actix_web::{HttpResponse, ResponseError};
 use bytes::Bytes;
 use std::error::Error;
 use std::fmt;
+use std::time::Duration;
 use tracing::warn;
 
 /// Bytes of an upstream error body kept in a log line.
@@ -91,11 +92,34 @@ pub async fn send_chat(
         .post(upstream.chat_url())
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(body);
-    // bearer_auth also marks the header as sensitive.
-    let request = match &upstream.api_key {
+    send(authorized(request, upstream), upstream).await
+}
+
+/// `GET {base_url}/models`, read in full. `timeout` bounds the whole
+/// request, so one slow upstream can't hold up the combined list.
+pub async fn send_models(
+    client: &reqwest::Client,
+    upstream: &Upstream,
+    timeout: Duration,
+) -> Result<Bytes, UpstreamFailure> {
+    let request = authorized(client.get(upstream.models_url()), upstream).timeout(timeout);
+    read_body(send(request, upstream).await?).await
+}
+
+/// Adds the upstream's own key, if it has one. `bearer_auth` also marks
+/// the header as sensitive.
+fn authorized(request: reqwest::RequestBuilder, upstream: &Upstream) -> reqwest::RequestBuilder {
+    match &upstream.api_key {
         Some(key) => request.bearer_auth(key.expose()),
         None => request,
-    };
+    }
+}
+
+/// Sends `request`; anything but a 2xx answer is a failure.
+async fn send(
+    request: reqwest::RequestBuilder,
+    upstream: &Upstream,
+) -> Result<reqwest::Response, UpstreamFailure> {
     let response = request.send().await.map_err(classify)?;
     if response.status().is_success() {
         Ok(response)

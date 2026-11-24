@@ -6,6 +6,7 @@ use crate::error::ApiError;
 use crate::handlers::get_stats;
 use crate::middleware::{RateLimitMiddleware, RateLimiter, TrackingMiddleware};
 use crate::proxy::chat::chat_completions;
+use crate::proxy::models::list_models;
 use crate::proxy::upstream::build_http_client;
 use crate::tracking::RequestTracker;
 use actix_web::body::MessageBody;
@@ -63,6 +64,7 @@ pub fn build_app(
                 .wrap(RateLimitMiddleware::new(state.limiter.clone()))
                 .wrap(from_fn(require_api_key))
                 .route("/chat/completions", web::post().to(chat_completions))
+                .route("/models", web::get().to(list_models))
                 .route("/stats", web::get().to(get_stats)),
         )
         .default_service(web::to(not_found))
