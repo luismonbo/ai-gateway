@@ -16,6 +16,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error};
 
+/// Longest `upstream/model` label kept; longer ones are cut.
+const MAX_LABEL_BYTES: usize = 256;
+/// Distinct labels kept per key; answers from further models count under
+/// `upstream/(other)`.
+const MAX_LABELS_PER_KEY: usize = 100;
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default)]
 pub struct KeyStats {
@@ -55,6 +61,20 @@ impl KeyStats {
                 .max(other.last_request_timestamp),
         }
     }
+}
+
+/// The label to count an answer under. The model part comes from the
+/// client or the upstream, so both its length and the number of labels per
+/// key are capped: a client inventing model names can't grow the stats.
+fn bounded_label(models: &BTreeMap<String, u64>, label: &str) -> String {
+    let label = &label[..label.floor_char_boundary(MAX_LABEL_BYTES)];
+    if models.len() < MAX_LABELS_PER_KEY || models.contains_key(label) {
+        return label.to_string();
+    }
+    let upstream = label
+        .split_once('/')
+        .map_or(label, |(upstream, _)| upstream);
+    format!("{upstream}/(other)")
 }
 
 /// `models` with `count` more answers from `model`. It takes the map by
@@ -179,15 +199,18 @@ impl StatsStore {
     /// tokens when the upstream reported them.
     pub fn record_completion(&self, key: &KeyId, model_label: &str, usage: Option<Usage>) {
         let usage = usage.unwrap_or_default();
-        self.update(key, |stats| KeyStats {
-            total_prompt_tokens: stats
-                .total_prompt_tokens
-                .saturating_add(usage.prompt_tokens),
-            total_completion_tokens: stats
-                .total_completion_tokens
-                .saturating_add(usage.completion_tokens),
-            models_used: counted(stats.models_used, model_label, 1),
-            ..stats
+        self.update(key, |stats| {
+            let label = bounded_label(&stats.models_used, model_label);
+            KeyStats {
+                total_prompt_tokens: stats
+                    .total_prompt_tokens
+                    .saturating_add(usage.prompt_tokens),
+                total_completion_tokens: stats
+                    .total_completion_tokens
+                    .saturating_add(usage.completion_tokens),
+                models_used: counted(stats.models_used, &label, 1),
+                ..stats
+            }
         });
     }
 

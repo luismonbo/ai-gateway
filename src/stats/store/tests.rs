@@ -262,3 +262,32 @@ async fn flusher_saves_on_its_interval() {
     flusher.abort();
     assert!(saved, "the flusher never wrote {}", path.display());
 }
+
+#[test]
+fn long_model_labels_are_cut() {
+    let store = StatsStore::default();
+    // Two-byte characters, so the cut has to land on a character boundary.
+    let label = format!("primary/{}", "é".repeat(300));
+    store.record_completion(&key("a"), &label, None);
+
+    let models = store.get(&key("a")).unwrap().models_used;
+    let kept: Vec<&String> = models.keys().collect();
+    assert_eq!(kept.len(), 1);
+    assert!(kept[0].len() <= 256, "{} bytes", kept[0].len());
+    assert!(label.starts_with(kept[0].as_str()));
+}
+
+#[test]
+fn distinct_labels_per_key_are_capped() {
+    let store = StatsStore::default();
+    for i in 0..105 {
+        store.record_completion(&key("a"), &format!("primary/model-{i}"), None);
+    }
+    // A label it already has still counts as itself.
+    store.record_completion(&key("a"), "primary/model-0", None);
+
+    let models = store.get(&key("a")).unwrap().models_used;
+    assert_eq!(models.len(), 101, "{:?}", models.keys().last());
+    assert_eq!(models["primary/(other)"], 5);
+    assert_eq!(models["primary/model-0"], 2);
+}
