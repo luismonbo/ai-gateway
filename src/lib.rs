@@ -6,4 +6,5 @@ pub mod handlers;
 pub mod logging;
 pub mod middleware;
 pub mod proxy;
+pub mod rate_limit;
 pub mod tracking;

@@ -17,6 +17,7 @@ const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8080;
 /// 10 MiB.
 const DEFAULT_MAX_REQUEST_BYTES: usize = 10 * 1024 * 1024;
+const DEFAULT_RATE_LIMIT_RPM: u32 = 60;
 const USER_KEYS: &str = "GATEWAY_API_KEYS";
 const ADMIN_KEYS: &str = "ADMIN_API_KEYS";
 /// Keys shorter than this get a startup warning.
@@ -42,6 +43,8 @@ pub struct Config {
     /// Longest silence allowed while waiting for upstream data.
     pub upstream_timeout: Duration,
     pub max_request_bytes: usize,
+    /// Requests per minute per key; also the burst size.
+    pub rate_limit_rpm: u32,
 }
 
 /// A configuration rule that was broken, and the variable that broke it.
@@ -82,6 +85,7 @@ impl Config {
         let connect_timeout = seconds(&env, "UPSTREAM_CONNECT_TIMEOUT_SECS", 10)?;
         let upstream_timeout = seconds(&env, "UPSTREAM_TIMEOUT_SECS", 300)?;
         let max_request_bytes = positive(&env, "MAX_REQUEST_BYTES", DEFAULT_MAX_REQUEST_BYTES)?;
+        let rate_limit_rpm = positive(&env, "RATE_LIMIT_RPM", DEFAULT_RATE_LIMIT_RPM)?;
 
         let config = Config {
             host,
@@ -93,6 +97,7 @@ impl Config {
             connect_timeout,
             upstream_timeout,
             max_request_bytes,
+            rate_limit_rpm,
         };
         let warnings = [key_warnings, upstream_warnings, legacy_warnings(&env)].concat();
         Ok((config, warnings))
@@ -140,6 +145,10 @@ impl Config {
             self.upstream_timeout.as_secs(),
             self.max_request_bytes
         );
+        let rate_limit = format!(
+            "rate limit: {} requests per minute per key",
+            self.rate_limit_rpm
+        );
         let keys = format!(
             "API keys: {} user, {} admin",
             self.keys.count(Role::User),
@@ -147,7 +156,7 @@ impl Config {
         );
         std::iter::once(address)
             .chain(upstreams)
-            .chain([default_upstream, limits, keys])
+            .chain([default_upstream, limits, rate_limit, keys])
             .collect()
     }
 }
@@ -308,6 +317,7 @@ mod tests {
         assert_eq!(config.connect_timeout, Duration::from_secs(10));
         assert_eq!(config.upstream_timeout, Duration::from_secs(300));
         assert_eq!(config.max_request_bytes, 10_485_760);
+        assert_eq!(config.rate_limit_rpm, 60);
         assert_eq!(config.default_upstream, None);
 
         let (config, _) = load(&[
@@ -328,6 +338,7 @@ mod tests {
             "UPSTREAM_CONNECT_TIMEOUT_SECS",
             "UPSTREAM_TIMEOUT_SECS",
             "MAX_REQUEST_BYTES",
+            "RATE_LIMIT_RPM",
         ] {
             let err = load(&[("GATEWAY_API_KEYS", LONG), (name, "0")]).unwrap_err();
             assert_eq!(err.variable, name);

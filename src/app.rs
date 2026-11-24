@@ -4,10 +4,11 @@ use crate::auth::require_api_key;
 use crate::config::Config;
 use crate::error::ApiError;
 use crate::handlers::get_stats;
-use crate::middleware::{RateLimitMiddleware, RateLimiter, TrackingMiddleware};
+use crate::middleware::TrackingMiddleware;
 use crate::proxy::chat::chat_completions;
 use crate::proxy::models::list_models;
 use crate::proxy::upstream::build_http_client;
+use crate::rate_limit::{enforce_rate_limit, RateLimiter};
 use crate::tracking::RequestTracker;
 use actix_web::body::MessageBody;
 use actix_web::dev::{ServiceFactory, ServiceRequest, ServiceResponse};
@@ -21,17 +22,18 @@ pub struct AppState {
     /// One client for every upstream request, so connections are reused.
     pub http: reqwest::Client,
     pub stats: Arc<RwLock<RequestTracker>>,
-    pub limiter: Arc<RateLimiter>,
+    pub limiter: RateLimiter,
 }
 
 impl AppState {
     pub fn new(config: Config, stats: Arc<RwLock<RequestTracker>>) -> reqwest::Result<AppState> {
         let http = build_http_client(&config)?;
+        let limiter = RateLimiter::new(config.rate_limit_rpm);
         Ok(AppState {
             config,
             http,
             stats,
-            limiter: Arc::new(RateLimiter::new(60)),
+            limiter,
         })
     }
 }
@@ -61,7 +63,7 @@ pub fn build_app(
         .service(
             web::scope("/v1")
                 .wrap(TrackingMiddleware::new(state.stats.clone()))
-                .wrap(RateLimitMiddleware::new(state.limiter.clone()))
+                .wrap(from_fn(enforce_rate_limit))
                 .wrap(from_fn(require_api_key))
                 .route("/chat/completions", web::post().to(chat_completions))
                 .route("/models", web::get().to(list_models))
