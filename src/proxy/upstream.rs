@@ -191,27 +191,51 @@ pub fn describe_failure(upstream: &Upstream, failure: &UpstreamFailure) -> Strin
     }
 }
 
-/// The first [`LOGGED_BODY_BYTES`] of `body` as lossy UTF-8, key redacted.
+/// The first [`LOGGED_BODY_BYTES`] of `body`, with the upstream's key
+/// redacted, as lossy UTF-8 with control characters escaped, so the excerpt
+/// stays on one log line and can't fake another.
 fn body_excerpt(body: &[u8], key: Option<&str>) -> String {
-    let key = key.filter(|key| !key.is_empty());
-    // Decode a key's length past the limit, so a key that starts before the
-    // cut is still found and replaced whole.
-    let window = LOGGED_BODY_BYTES + key.map_or(0, str::len);
-    let text = String::from_utf8_lossy(&body[..body.len().min(window)]);
-    let redacted = match key {
-        Some(key) => text.replace(key, REDACTED),
-        None => text.into_owned(),
-    };
-    truncate(&redacted, LOGGED_BODY_BYTES).to_string()
+    let start = redacted(body, key, LOGGED_BODY_BYTES);
+    let text = String::from_utf8_lossy(&start[..start.len().min(LOGGED_BODY_BYTES)]);
+    escape_controls(&text)
 }
 
-/// At most `max` bytes, cut at a character boundary.
-fn truncate(text: &str, max: usize) -> &str {
-    let end = (0..=max.min(text.len()))
-        .rev()
-        .find(|&i| text.is_char_boundary(i))
-        .unwrap_or(0);
-    &text[..end]
+/// `body` with every copy of `key` replaced by `[redacted]`, read until the
+/// result holds `limit` bytes. Matching while reading means a copy that
+/// starts before the limit is always replaced whole, however many came first.
+fn redacted(body: &[u8], key: Option<&str>, limit: usize) -> Vec<u8> {
+    let key = key.map(str::as_bytes).filter(|key| !key.is_empty());
+    let mut out = Vec::with_capacity(body.len().min(limit));
+    let mut rest = body;
+    while out.len() < limit {
+        let Some((&byte, after)) = rest.split_first() else {
+            break;
+        };
+        match key {
+            Some(key) if rest.starts_with(key) => {
+                out.extend_from_slice(REDACTED.as_bytes());
+                rest = &rest[key.len()..];
+            }
+            _ => {
+                out.push(byte);
+                rest = after;
+            }
+        }
+    }
+    out
+}
+
+/// Control characters, line breaks included, written as escapes like `\n`.
+fn escape_controls(text: &str) -> String {
+    text.chars()
+        .fold(String::with_capacity(text.len()), |mut out, c| {
+            if c.is_control() {
+                out.extend(c.escape_default());
+            } else {
+                out.push(c);
+            }
+            out
+        })
 }
 
 fn classify(error: reqwest::Error) -> UpstreamFailure {

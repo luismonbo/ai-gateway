@@ -235,3 +235,46 @@ async fn send_chat_returns_status_failures_with_body() {
     assert_eq!(body, "busy");
     assert_eq!(retry_after.as_ref().unwrap(), "7");
 }
+
+/// A 500 failure from `mock` whose body is `body`.
+fn failure_with_body(body: String) -> UpstreamFailure {
+    UpstreamFailure::Status {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        retry_after: None,
+        content_type: None,
+        body: Bytes::from(body),
+    }
+}
+
+#[test]
+fn repeated_keys_are_redacted_before_the_cut() {
+    // 51 characters, like the reviewer's repro: one copy near the start and
+    // one that starts past byte 512 of the original body.
+    let key = "sk-repeat-0123456789abcdefghijklmnopqrstuvwxyzABCDE";
+    assert_eq!(key.len(), 51);
+    let config = config("http://127.0.0.1:9/v1", Some(key));
+    let head = format!("{}{key}", "a".repeat(20));
+    let filler = "b".repeat(530 - head.len());
+    let body = format!("{head}{filler}{key}{}", "c".repeat(2000));
+
+    let description = describe_failure(mock(&config), &failure_with_body(body));
+    assert!(description.contains("[redacted]"), "{description}");
+    // Not even a 10-character piece of the key may survive.
+    assert!(!description.contains(&key[..10]), "{description}");
+}
+
+#[test]
+fn logged_excerpts_escape_line_breaks() {
+    let config = config("http://127.0.0.1:9/v1", None);
+    let body = "<html>\r\n<h1>502 Bad Gateway</h1>\nINFO forged: entry\t".to_string();
+
+    let description = describe_failure(mock(&config), &failure_with_body(body));
+    assert!(
+        !description.contains(['\n', '\r', '\t']),
+        "raw control characters: {description:?}"
+    );
+    assert!(
+        description.contains(r"\r\n<h1>502 Bad Gateway</h1>\nINFO forged"),
+        "{description}"
+    );
+}
