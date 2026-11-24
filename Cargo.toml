@@ -24,3 +24,4 @@ dotenvy = "0.15"
 
 [dev-dependencies]
 actix-http = "3"
+wiremock = "0.6"
