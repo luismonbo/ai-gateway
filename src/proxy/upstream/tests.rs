@@ -70,6 +70,7 @@ fn fallback_triggers_match_the_spec() {
 
 #[actix_web::test]
 async fn failures_map_to_the_error_table() {
+    let unreachable = config("http://127.0.0.1:9/v1", None);
     let cases = [
         (
             UpstreamFailure::Unreachable("refused".into()),
@@ -84,7 +85,7 @@ async fn failures_map_to_the_error_table() {
         (failure(429, Some("20")), 429, "upstream_rate_limited"),
     ];
     for (failure, expected_status, expected_code) in cases {
-        let response = failure_response("mock", &failure);
+        let response = failure_response(mock(&unreachable), &failure);
         assert_eq!(response.status().as_u16(), expected_status, "{failure}");
         let retry_after = response.headers().get(RETRY_AFTER).cloned();
 
@@ -106,6 +107,7 @@ async fn failures_map_to_the_error_table() {
 
 #[actix_web::test]
 async fn other_4xx_bodies_pass_through() {
+    let unreachable = config("http://127.0.0.1:9/v1", None);
     let body = Bytes::from_static(br#"{"error":{"message":"model 'nope' not found"}}"#);
     let failure = UpstreamFailure::Status {
         status: StatusCode::NOT_FOUND,
@@ -113,7 +115,7 @@ async fn other_4xx_bodies_pass_through() {
         content_type: Some(HeaderValue::from_static("application/json")),
         body: body.clone(),
     };
-    let response = failure_response("mock", &failure);
+    let response = failure_response(mock(&unreachable), &failure);
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(
         response.headers().get(CONTENT_TYPE).unwrap(),
@@ -276,5 +278,25 @@ fn logged_excerpts_escape_line_breaks() {
     assert!(
         description.contains(r"\r\n<h1>502 Bad Gateway</h1>\nINFO forged"),
         "{description}"
+    );
+}
+
+#[actix_web::test]
+async fn passed_through_bodies_never_carry_the_upstream_key() {
+    let config = config("http://127.0.0.1:9/v1", Some(UPSTREAM_KEY));
+    let body = format!(r#"{{"error":{{"message":"no model 'm' (key {UPSTREAM_KEY})"}}}}"#);
+    let failure = UpstreamFailure::Status {
+        status: StatusCode::NOT_FOUND,
+        retry_after: None,
+        content_type: Some(HeaderValue::from_static("application/json")),
+        body: Bytes::from(body),
+    };
+
+    let response = failure_response(mock(&config), &failure);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let sent = to_bytes(response.into_body()).await.unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&sent),
+        r#"{"error":{"message":"no model 'm' (key [redacted])"}}"#
     );
 }

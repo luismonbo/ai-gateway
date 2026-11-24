@@ -147,7 +147,9 @@ pub fn should_fallback(failure: &UpstreamFailure) -> bool {
 /// What the client gets. Bodies of 401, 403, 429 and 5xx responses are
 /// never returned; other 4xx bodies explain the client's mistake and pass
 /// through unchanged.
-pub fn failure_response(upstream: &str, failure: &UpstreamFailure) -> HttpResponse {
+pub fn failure_response(upstream: &Upstream, failure: &UpstreamFailure) -> HttpResponse {
+    let key = upstream.api_key.as_ref().map(UpstreamKey::expose);
+    let upstream = upstream.name.as_str();
     let error = match failure {
         UpstreamFailure::Unreachable(_) => ApiError::upstream_unavailable(upstream),
         UpstreamFailure::Timeout => ApiError::upstream_timeout(upstream),
@@ -159,23 +161,37 @@ pub fn failure_response(upstream: &str, failure: &UpstreamFailure) -> HttpRespon
         } => match status.as_u16() {
             401 | 403 => ApiError::upstream_auth_failed(upstream),
             429 => ApiError::upstream_rate_limited(upstream, retry_after.clone()),
-            400..=499 => return passed_through(*status, content_type.as_ref(), body),
+            400..=499 => return passed_through(*status, content_type.as_ref(), body, key),
             _ => ApiError::upstream_error(upstream),
         },
     };
     error.error_response()
 }
 
+/// The upstream's own 4xx answer, with its key replaced by `[redacted]` in
+/// case the upstream echoed it.
 fn passed_through(
     status: StatusCode,
     content_type: Option<&HeaderValue>,
     body: &Bytes,
+    key: Option<&str>,
 ) -> HttpResponse {
+    let leaks_key = key.is_some_and(|key| {
+        !key.is_empty()
+            && body
+                .windows(key.len())
+                .any(|window| window == key.as_bytes())
+    });
+    let body = if leaks_key {
+        Bytes::from(redacted(body, key, usize::MAX))
+    } else {
+        body.clone()
+    };
     match content_type {
         Some(content_type) => HttpResponse::build(status)
             .insert_header((CONTENT_TYPE, content_type.clone()))
-            .body(body.clone()),
-        None => HttpResponse::build(status).body(body.clone()),
+            .body(body),
+        None => HttpResponse::build(status).body(body),
     }
 }
 

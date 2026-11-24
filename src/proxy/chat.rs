@@ -118,7 +118,7 @@ pub async fn chat_completions(
                 "upstream request failed"
             );
             with_header(
-                failure_response(&upstream.name, &failure),
+                failure_response(upstream, &failure),
                 UPSTREAM_HEADER,
                 &upstream.name,
             )
@@ -164,7 +164,7 @@ async fn fall_back(
                 error = %describe_failure(backup, &failure),
                 "fallback upstream failed too"
             );
-            failure_response(&backup.name, &failure)
+            failure_response(backup, &failure)
         }
     };
     let response = with_header(response, UPSTREAM_HEADER, &backup.name);
