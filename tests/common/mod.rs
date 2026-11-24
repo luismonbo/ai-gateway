@@ -15,12 +15,19 @@ use std::sync::{Arc, RwLock};
 pub const USER_KEY: &str = "test-user-key-0123456789abcdef01234567";
 pub const ADMIN_KEY: &str = "test-admin-key-0123456789abcdef0123456";
 
-/// A valid config: the two test keys plus `overrides`. An override wins over
-/// a base value, and `("X", "")` unsets X (blank values count as unset).
+/// Nothing listens on port 9, so a request that reaches it fails to connect.
+pub const UNREACHABLE_URL: &str = "http://127.0.0.1:9/v1";
+
+/// A valid config: the two test keys and two upstreams, `primary` and
+/// `backup`, plus `overrides`. An override wins over a base value, and
+/// `("X", "")` unsets X (blank values count as unset).
 pub fn config(overrides: &[(&str, &str)]) -> Config {
     let base = [
         ("GATEWAY_API_KEYS", USER_KEY),
         ("ADMIN_API_KEYS", ADMIN_KEY),
+        ("UPSTREAMS", "primary,backup"),
+        ("PRIMARY_BASE_URL", UNREACHABLE_URL),
+        ("BACKUP_BASE_URL", UNREACHABLE_URL),
     ];
     let lookup = |name: &str| {
         overrides

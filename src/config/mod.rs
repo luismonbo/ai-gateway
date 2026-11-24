@@ -4,12 +4,19 @@
 //! stops startup with a message naming the variable. Error and warning texts
 //! never contain a key, only its key ID.
 
-use crate::auth::{KeyId, KeyStore, KeyStoreError};
+mod upstreams;
+
+pub use upstreams::{FallbackTarget, Upstream, UpstreamKey};
+
+use crate::auth::{KeyId, KeyStore, KeyStoreError, Role};
 use std::fmt;
 use std::str::FromStr;
+use std::time::Duration;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8080;
+/// 10 MiB.
+const DEFAULT_MAX_REQUEST_BYTES: usize = 10 * 1024 * 1024;
 const USER_KEYS: &str = "GATEWAY_API_KEYS";
 const ADMIN_KEYS: &str = "ADMIN_API_KEYS";
 /// Keys shorter than this get a startup warning.
@@ -28,6 +35,13 @@ pub struct Config {
     pub port: u16,
     pub log_format: LogFormat,
     pub keys: KeyStore,
+    /// In `UPSTREAMS` order.
+    pub upstreams: Vec<Upstream>,
+    pub default_upstream: Option<String>,
+    pub connect_timeout: Duration,
+    /// Longest silence allowed while waiting for upstream data.
+    pub upstream_timeout: Duration,
+    pub max_request_bytes: usize,
 }
 
 /// A configuration rule that was broken, and the variable that broke it.
@@ -63,15 +77,78 @@ impl Config {
         let port = positive(&env, "PORT", DEFAULT_PORT)?;
         let log_format = log_format(&env)?;
         let (keys, key_warnings) = key_store(&env)?;
+        let (upstreams, upstream_warnings) = upstreams::upstreams(&env)?;
+        let default_upstream = upstreams::default_upstream(&env, &upstreams)?;
+        let connect_timeout = seconds(&env, "UPSTREAM_CONNECT_TIMEOUT_SECS", 10)?;
+        let upstream_timeout = seconds(&env, "UPSTREAM_TIMEOUT_SECS", 300)?;
+        let max_request_bytes = positive(&env, "MAX_REQUEST_BYTES", DEFAULT_MAX_REQUEST_BYTES)?;
 
         let config = Config {
             host,
             port,
             log_format,
             keys,
+            upstreams,
+            default_upstream,
+            connect_timeout,
+            upstream_timeout,
+            max_request_bytes,
         };
-        let warnings = [key_warnings, legacy_warnings(&env)].concat();
+        let warnings = [key_warnings, upstream_warnings, legacy_warnings(&env)].concat();
         Ok((config, warnings))
+    }
+
+    pub fn upstream(&self, name: &str) -> Option<&Upstream> {
+        self.upstreams.iter().find(|upstream| upstream.name == name)
+    }
+
+    pub fn upstream_names(&self) -> Vec<&str> {
+        self.upstreams
+            .iter()
+            .map(|upstream| upstream.name.as_str())
+            .collect()
+    }
+
+    /// What the gateway will do, for the startup log. Never contains a key.
+    pub fn summary_lines(&self) -> Vec<String> {
+        let address = format!("bind address: {}:{}", self.host, self.port);
+        let upstreams = self.upstreams.iter().map(|upstream| {
+            format!(
+                "upstream {}: {} (api key: {}, fallback: {})",
+                upstream.name,
+                upstream.base_url,
+                if upstream.api_key.is_some() {
+                    "set"
+                } else {
+                    "none"
+                },
+                upstream
+                    .fallback
+                    .as_ref()
+                    .map_or_else(|| "none".to_string(), ToString::to_string),
+            )
+        });
+        let default_upstream = format!(
+            "default upstream: {}",
+            self.default_upstream
+                .as_deref()
+                .unwrap_or("none (models need an upstream prefix)")
+        );
+        let limits = format!(
+            "upstream timeouts: connect {} s, idle {} s; max request body: {} bytes",
+            self.connect_timeout.as_secs(),
+            self.upstream_timeout.as_secs(),
+            self.max_request_bytes
+        );
+        let keys = format!(
+            "API keys: {} user, {} admin",
+            self.keys.count(Role::User),
+            self.keys.count(Role::Admin)
+        );
+        std::iter::once(address)
+            .chain(upstreams)
+            .chain([default_upstream, limits, keys])
+            .collect()
     }
 }
 
@@ -126,6 +203,11 @@ where
             format!("{raw:?} must be greater than 0"),
         ))
     }
+}
+
+/// A whole number of seconds greater than 0.
+fn seconds(env: &Env, name: &str, default: u64) -> Result<Duration, ConfigError> {
+    positive(env, name, default).map(Duration::from_secs)
 }
 
 fn log_format(env: &Env) -> Result<LogFormat, ConfigError> {
@@ -194,10 +276,13 @@ mod tests {
     use super::*;
     use crate::auth::Role;
 
-    const LONG: &str = "0123456789abcdef0123456789abcdef"; // 32 characters
+    pub(super) const LONG: &str = "0123456789abcdef0123456789abcdef"; // 32 characters
     const LONG2: &str = "fedcba9876543210fedcba9876543210";
 
-    fn lookup<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+    /// A lookup over fixed pairs; the first pair with the name wins.
+    pub(super) fn lookup<'a>(
+        vars: &'a [(&'a str, &'a str)],
+    ) -> impl Fn(&str) -> Option<String> + 'a {
         move |name| {
             vars.iter()
                 .find(|(key, _)| *key == name)
@@ -205,8 +290,72 @@ mod tests {
         }
     }
 
+    /// One valid upstream, so tests here can focus on other variables.
+    const UPSTREAM_BASE: [(&str, &str); 2] = [
+        ("UPSTREAMS", "local"),
+        ("LOCAL_BASE_URL", "http://127.0.0.1:9/v1"),
+    ];
+
+    /// `vars` plus [`UPSTREAM_BASE`]; an entry in `vars` wins over the base.
     fn load(vars: &[(&str, &str)]) -> Result<(Config, Vec<String>), ConfigError> {
-        Config::from_lookup(lookup(vars))
+        let all: Vec<(&str, &str)> = vars.iter().copied().chain(UPSTREAM_BASE).collect();
+        Config::from_lookup(lookup(&all))
+    }
+
+    #[test]
+    fn timeouts_and_limit_have_defaults() {
+        let (config, _) = load(&[("GATEWAY_API_KEYS", LONG)]).unwrap();
+        assert_eq!(config.connect_timeout, Duration::from_secs(10));
+        assert_eq!(config.upstream_timeout, Duration::from_secs(300));
+        assert_eq!(config.max_request_bytes, 10_485_760);
+        assert_eq!(config.default_upstream, None);
+
+        let (config, _) = load(&[
+            ("GATEWAY_API_KEYS", LONG),
+            ("UPSTREAM_CONNECT_TIMEOUT_SECS", "3"),
+            ("UPSTREAM_TIMEOUT_SECS", "30"),
+            ("MAX_REQUEST_BYTES", "1024"),
+        ])
+        .unwrap();
+        assert_eq!(config.connect_timeout, Duration::from_secs(3));
+        assert_eq!(config.upstream_timeout, Duration::from_secs(30));
+        assert_eq!(config.max_request_bytes, 1024);
+    }
+
+    #[test]
+    fn zero_timeouts_are_rejected() {
+        for name in [
+            "UPSTREAM_CONNECT_TIMEOUT_SECS",
+            "UPSTREAM_TIMEOUT_SECS",
+            "MAX_REQUEST_BYTES",
+        ] {
+            let err = load(&[("GATEWAY_API_KEYS", LONG), (name, "0")]).unwrap_err();
+            assert_eq!(err.variable, name);
+        }
+    }
+
+    #[test]
+    fn old_env_file_gets_clear_messages() {
+        let old = [
+            ("AI_PROVIDER", "ollama"),
+            ("OLLAMA_BASE_URL", "http://localhost:11434"),
+            ("OPENAI_BASE_URL", "https://api.openai.com"),
+            ("OPENAI_API_KEY", "sk-old"),
+            ("GATEWAY_API_KEYS", LONG),
+        ];
+        assert_eq!(
+            Config::from_lookup(lookup(&old)).unwrap_err().variable,
+            "UPSTREAMS"
+        );
+        let fixed: Vec<_> = old
+            .iter()
+            .copied()
+            .chain([("UPSTREAMS", "ollama,openai")])
+            .collect();
+        let (_, warnings) = Config::from_lookup(lookup(&fixed)).unwrap();
+        for name in ["AI_PROVIDER", "OLLAMA_BASE_URL", "OPENAI_BASE_URL"] {
+            assert!(warnings.iter().any(|w| w.contains(name)), "{name}");
+        }
     }
 
     #[test]
