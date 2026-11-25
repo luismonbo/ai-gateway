@@ -10,3 +10,6 @@ stats.json*
 
 # macOS
 .DS_Store
+
+# Design docs and implementation plans stay local
+docs/
