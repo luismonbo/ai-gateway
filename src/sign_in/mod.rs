@@ -1,6 +1,7 @@
 //! Signing in to Azure for upstreams with `<NAME>_AUTH`.
 
 pub mod cache;
+pub mod credentials;
 pub mod transport;
 
 #[cfg(test)]
