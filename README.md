@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/LuisMongeB/ai-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/LuisMongeB/ai-gateway/actions/workflows/ci.yml)
 
-An OpenAI-compatible gateway that routes requests to Ollama, OpenAI and other OpenAI-style backends by model prefix, with API keys, rate limits, fallback and usage stats. Clients talk to one endpoint and pick a backend with a prefix such as `ollama/gemma4:e2b` or `openai/gpt-6-terra`. Requests are forwarded with only the model name rewritten (streaming requests also get usage reporting switched on), and answers come back byte for byte, so tools, images, JSON mode, sampling parameters and streaming work wherever the backend supports them. It is written in Rust with actix-web and runs as a single binary or a small Docker image.
+An OpenAI-compatible gateway that routes requests to Ollama, OpenAI, Azure OpenAI and other OpenAI-style backends by model prefix, with API keys, keyless Azure sign-in, rate limits, fallback and usage stats. Clients talk to one endpoint and pick a backend with a prefix such as `ollama/gemma4:e2b` or `openai/gpt-6-terra`. Requests are forwarded with only the model name rewritten (streaming requests also get usage reporting switched on), and answers come back byte for byte, so tools, images, JSON mode, sampling parameters and streaming work wherever the backend supports them. It is written in Rust with actix-web and runs as a single binary or a small Docker image.
 
 ## Quick start
 
@@ -83,6 +83,10 @@ Everything is set with environment variables, read once at startup. A blank valu
 | `DEFAULT_UPSTREAM` | none | Upstream for model names without a known prefix. |
 | `<NAME>_BASE_URL` | required per upstream | OpenAI-style base URL including the version path. |
 | `<NAME>_API_KEY` | none | Sent to that upstream as `Authorization: Bearer …`. |
+| `<NAME>_AUTH` | none | `managed_identity` or `azure_cli`: sign in to Azure instead of sending a key (see [Azure OpenAI](#azure-openai)). Unset keeps `<NAME>_API_KEY` if set, otherwise no auth. |
+| `<NAME>_CLIENT_ID` | none | Client ID of a user-assigned managed identity. Unset means the system-assigned identity. |
+| `<NAME>_TOKEN_SCOPE` | `https://ai.azure.com/.default` | The scope Azure tokens are requested for. |
+| `<NAME>_MODELS` | none | Comma-separated models that `GET /v1/models` lists for this upstream, such as your Azure deployment names. When set, the upstream isn't asked for its list. Works for any upstream. |
 | `<NAME>_FALLBACK` | none | `upstream/model`, e.g. `OLLAMA_FALLBACK=openai/gpt-6-terra`. |
 | `UPSTREAM_CONNECT_TIMEOUT_SECS` | `10` | How long to wait for a connection to an upstream. |
 | `UPSTREAM_TIMEOUT_SECS` | `300` | Longest silence allowed while waiting for upstream data. It resets on every chunk, so long streams are fine. |
@@ -95,6 +99,7 @@ An upstream's variables use its name in upper case: `ollama` reads `OLLAMA_BASE_
 |---|---|
 | Ollama | `http://localhost:11434/v1` |
 | OpenAI | `https://api.openai.com/v1` |
+| Azure OpenAI | `https://<resource>.openai.azure.com/openai/v1` |
 | Groq | `https://api.groq.com/openai/v1` |
 | vLLM | `http://localhost:8000/v1` |
 
@@ -103,10 +108,16 @@ The gateway checks the configuration before it starts, and the first broken rule
 - Upstream names use only lowercase letters, digits and `_`, and each appears once.
 - Every upstream needs a base URL that starts with `http://` or `https://`. Credentials, query strings and fragments are rejected; put the key in `<NAME>_API_KEY`. A URL without a path (such as `https://api.openai.com`) starts with a warning.
 - `DEFAULT_UPSTREAM` and every fallback target must name a configured upstream.
+- `<NAME>_AUTH` is `managed_identity` or `azure_cli`, in any letter case, and can't be set together with `<NAME>_API_KEY`.
+- `<NAME>_CLIENT_ID` must be a GUID. With `azure_cli`, or without `<NAME>_AUTH`, it's ignored with a warning, because a shell may export `AZURE_CLIENT_ID` for other tools.
+- `<NAME>_TOKEN_SCOPE` must be an `https://` URL. Without `<NAME>_AUTH` it's ignored with a warning.
+- With `<NAME>_AUTH`, the base URL must start with `https://`, so tokens never travel in clear text; `http://` is accepted only for `localhost` and loopback addresses. A host outside `*.openai.azure.com`, `*.services.ai.azure.com` and `*.cognitiveservices.azure.com`, such as an API Management proxy, gets a warning that tokens will be sent there.
+- A model listed twice in `<NAME>_MODELS` is an error. An entry that already starts with `<name>/` gets a warning, because the gateway adds the prefix itself.
+- A managed identity the Azure libraries can't use here stops startup with their reason: on Azure Arc, Service Fabric, Cloud Shell or Azure ML, or AKS workload identity without `AZURE_TENANT_ID`.
 - At least one gateway key is required, and a key can't be both a user key and an admin key. Keys shorter than 32 characters get a warning.
 - Numbers must be whole and greater than 0, and `PORT` must fit in 16 bits.
 
-The startup log lists the bind address, each upstream with its base URL and fallback, the default upstream, the limits and the number of keys. It never shows a key.
+The startup log lists the bind address, each upstream with its base URL, how it authenticates, its fallback and, with `<NAME>_MODELS`, how many models it lists, then the default upstream, the limits and the number of keys. It never shows a key.
 
 ## Routing
 
@@ -131,11 +142,62 @@ Prefixes match exactly and are case-sensitive.
 
 `OLLAMA_FALLBACK=openai/gpt-6-terra` sends a request to OpenAI as `gpt-6-terra` when Ollama can't answer it.
 
-- **What triggers it:** connection errors, timeouts, upstream 5xx and upstream 429. Other 4xx responses never do: they're the client's or the operator's mistake, and retrying elsewhere would hide them and could cost money.
+- **What triggers it:** connection errors, timeouts, upstream 5xx and upstream 429. Other 4xx responses never do, and neither does a failed Azure sign-in: they're the client's or the operator's mistake, and retrying elsewhere would hide them and could cost money.
 - **One hop:** a fallback's own fallback is never followed.
 - **Streaming:** streaming requests fall back too, because the switch happens before the first byte reaches the client.
 - **The request:** the same body, with `model` replaced by the fallback model.
 - **How you can tell:** the response carries `x-gateway-fallback: openai/gpt-6-terra`, its `model` field names the model that answered, and the log has a warning with the key ID, the primary's error and the fallback target. If the fallback fails too, the client gets the fallback's error and the log has both.
+
+## Azure OpenAI
+
+Azure OpenAI's v1 API is OpenAI-compatible, so Azure is an upstream like any other. Its base URL is the resource's endpoint plus `/openai/v1`: `https://<resource>.openai.azure.com/openai/v1`, or `https://<resource>.services.ai.azure.com/openai/v1` for an Azure AI Foundry resource. The model is your deployment name: with `UPSTREAMS=azure`, `azure/my-gpt4o` reaches Azure as `my-gpt4o`.
+
+The gateway can sign in to Azure itself, so no key goes into the configuration. Set `<NAME>_AUTH` to one of two methods.
+
+**`azure_cli`** signs in as whoever ran `az login` on the machine (Azure CLI 2.54 or later). On a laptop, for example:
+
+```ini
+UPSTREAMS=azure
+AZURE_BASE_URL=https://my-resource.openai.azure.com/openai/v1
+AZURE_AUTH=azure_cli
+AZURE_MODELS=my-gpt4o,my-gpt5-mini   # your deployment names, for /v1/models
+```
+
+If your account is in several tenants, sign in to the resource's tenant: `az login --tenant <tenant ID>`. The Docker image has no Azure CLI, so `azure_cli` works only outside it, for example with `cargo run`.
+
+**`managed_identity`** signs in as the Azure resource the gateway runs on. The gateway works out the platform from what Azure sets in its environment:
+
+- **VMs and scale sets, App Service, Functions and Container Apps:** the system-assigned identity, or a user-assigned one with `<NAME>_CLIENT_ID=<its client ID>`.
+- **AKS with workload identity:** when the pod is set up for it (`AZURE_FEDERATED_TOKEN_FILE` is set), the gateway signs in as the pod's identity, using the `AZURE_CLIENT_ID` the webhook sets unless `<NAME>_CLIENT_ID` names another.
+
+Before the first request:
+
+- **The role:** give the identity (or, with `azure_cli`, your account) the **Cognitive Services OpenAI User** role on the resource. A new assignment can take up to 5 minutes to apply; until then requests get 403.
+
+  ```bash
+  az role assignment create --role "Cognitive Services OpenAI User" \
+    --assignee <principal ID or user name> --scope <resource ID>
+  ```
+
+- **The custom subdomain:** the base URL must use the resource's custom subdomain (`<resource>.openai.azure.com`). Regional endpoints such as `https://eastus.api.cognitive.microsoft.com` answer 401 to tokens.
+
+How it behaves:
+
+- **Startup:** the gateway signs in once per Azure upstream and logs, for example, `upstream azure: signed in with azure cli; token valid for 74 min`. If it can't, it logs a warning with the reason and starts anyway; that upstream's requests fail until it can sign in.
+- **Tokens:** each upstream keeps its token in memory and fetches a new one when 5 minutes or less are left, so about once per token lifetime a request waits for sign-in: about a second with `azure_cli`, milliseconds in Azure. A fetch is bounded by `UPSTREAM_CONNECT_TIMEOUT_SECS`. Tokens never appear in logs, stats or responses.
+- **Failures:** a request that can't get a token gets a 502 `upstream_auth_failed` and never falls back; the reason is logged with the key ID.
+- **`/v1/models`:** Azure's own list holds the models the resource could deploy, not your deployments, and most of those fail as `model`. Set `<NAME>_MODELS` to your deployment names, and `/v1/models` lists exactly those without asking Azure.
+- **Stats:** they record the model Azure reports, such as `azure/gpt-4o-2024-11-20`, not the deployment name, so two deployments of the same model share a label.
+- **Token scope:** tokens are requested for `https://ai.azure.com/.default`. Older setups and other clouds may need another, set with `<NAME>_TOKEN_SCOPE`, such as `https://cognitiveservices.azure.com/.default`.
+- **API keys** work too: set `<NAME>_API_KEY` instead of `<NAME>_AUTH`, not both. Azure's v1 API accepts the key as a bearer token, as the OpenAI SDKs send it.
+
+| What you see | What to check |
+|---|---|
+| 502 `upstream_auth_failed`, and the log says `returned HTTP 401` | The base URL must use the resource's custom subdomain. If it does, try `<NAME>_TOKEN_SCOPE=https://cognitiveservices.azure.com/.default`. |
+| 502 `upstream_auth_failed`, and the log says `returned HTTP 403` | Give the identity the Cognitive Services OpenAI User role on the resource; a new assignment takes up to 5 minutes. Check that you signed in to the resource's tenant. |
+| 404 from Azure | `model` must be a deployment name, not the name of the model behind it. |
+| Startup warning `could not sign in with …` | The reason follows. With `azure_cli`: install the Azure CLI or run `az login`. With `managed_identity`: give the resource an identity, and check `<NAME>_CLIENT_ID`. |
+| `no token within …; raise UPSTREAM_CONNECT_TIMEOUT_SECS if signing in is slow` | Signing in took longer than `UPSTREAM_CONNECT_TIMEOUT_SECS` (10 s by default). Raise it if `az` is slow on this machine. |
 
 ## Endpoints
 
@@ -149,7 +211,7 @@ curl http://localhost:8080/health
 
 ### `POST /v1/chat/completions`
 
-The OpenAI chat completions API. Only `model` is rewritten, and streaming requests may gain `stream_options` (see below). The other fields reach the upstream with the same values and in the same order (`"stream": null` is left out, which means the same). Only the upstream's own key is sent to it, never the client's gateway key.
+The OpenAI chat completions API. Only `model` is rewritten, and streaming requests may gain `stream_options` (see below). The other fields reach the upstream with the same values and in the same order (`"stream": null` is left out, which means the same). Only the upstream's own key or Azure token is sent to it, never the client's gateway key.
 
 ```bash
 curl http://localhost:8080/v1/chat/completions \
@@ -195,7 +257,7 @@ curl http://localhost:8080/v1/models -H "Authorization: Bearer $GATEWAY_KEY"
 ]}
 ```
 
-Upstreams are asked at the same time, and each gets `UPSTREAM_CONNECT_TIMEOUT_SECS` (10 s by default) for its whole answer, so one hanging upstream can't hold up the list. An upstream that fails is left out and logged; the response is still 200.
+Upstreams are asked at the same time, and each gets `UPSTREAM_CONNECT_TIMEOUT_SECS` (10 s by default) for its whole answer, so one hanging upstream can't hold up the list. An upstream that fails, or can't get an Azure token, is left out and logged; the response is still 200. An upstream with `<NAME>_MODELS` isn't asked at all: its configured names are listed, in the order written, with `created` set to 0.
 
 ### `GET /v1/stats`
 
@@ -253,9 +315,10 @@ Every error the gateway produces uses OpenAI's format, so the SDKs report it lik
 | Upstream 5xx | 502 | `server_error` | `upstream_error` |
 | Upstream 429 | 429, with the upstream's `Retry-After` if it sent one | `rate_limit_error` | `upstream_rate_limited` |
 | Upstream 401 or 403 | 502, generic message | `server_error` | `upstream_auth_failed` |
+| The gateway couldn't get an Azure token (no fallback) | 502, generic message | `server_error` | `upstream_auth_failed` |
 | Any other upstream 4xx (400, 404, 413, 422…) | the same status | the upstream's own body, passed through | |
 
-Bodies of upstream 401, 403, 429 and 5xx responses are never returned, because they can contain fragments of the operator's upstream key or organisation ID. They're logged, truncated to 512 bytes, with the upstream's key replaced by `[redacted]` and line breaks escaped so each stays on one log line. Other 4xx bodies reach the client because they explain the client's mistake, such as an unknown model or a context that's too long; if one ever contains the upstream's key, the key is replaced by `[redacted]` first.
+Bodies of upstream 401, 403, 429 and 5xx responses are never returned, because they can contain fragments of the operator's upstream key or organisation ID. They're logged, truncated to 512 bytes, with the key or token the request carried replaced by `[redacted]` and line breaks escaped so each stays on one log line. Other 4xx bodies reach the client because they explain the client's mistake, such as an unknown model or a context that's too long; if one ever contains the request's key or token, it's replaced by `[redacted]` first.
 
 If an upstream fails in the middle of a stream, the status has already been sent, so the gateway logs the failure and aborts the connection instead of ending the stream as if the answer were complete.
 
@@ -280,7 +343,7 @@ At startup the file is loaded and saved straight away, so an unwritable `STATS_P
 - **Library:** logs go through `tracing`, as text or as JSON lines (`LOG_FORMAT=json`), and are filtered with `RUST_LOG`.
 - **Colours:** text logs use colour only when they go to a terminal and `NO_COLOR` isn't set.
 - **Access log:** every request gets one line with target `access`, holding the method, the path, the status, the latency, the IP address of the TCP peer (your reverse proxy's, if one sits in front) and the user agent. The query string is never logged. Quiet the access log with `RUST_LOG=info,access=warn`.
-- **Key IDs:** gateway log lines name keys by ID (`key_id` field). No raw key, gateway or upstream, is written to logs or stats, and an upstream's key is replaced by `[redacted]` in any upstream body the gateway logs or passes on.
+- **Key IDs:** gateway log lines name keys by ID (`key_id` field). No raw key, gateway or upstream, and no Azure token is written to logs or stats, and the key or token a request carried is replaced by `[redacted]` in any upstream body the gateway logs or passes on.
 
 ## Upgrading from 0.1
 
@@ -319,7 +382,12 @@ What changes for clients:
 - An upstream that rejects unknown request fields refuses streaming requests that don't ask for usage, because the gateway adds `stream_options.include_usage` to them.
 - HTTPS upstreams need a certificate from a public certificate authority. The gateway trusts Mozilla's bundled root certificates, not the system's, so a private CA isn't accepted yet.
 - Request bodies aren't decompressed: a body sent with `Content-Encoding: gzip` gets a 400. Leaving decompression out means a small compressed body can't expand into a huge one.
-- There are no retries, response caching, embeddings endpoint or Azure OpenAI support yet.
+- Only Azure's v1 API (`/openai/v1`) works; the classic `/openai/deployments/<name>/…?api-version=…` URLs don't.
+- Managed identity on Azure Arc, Service Fabric, Cloud Shell and Azure ML isn't supported.
+- Azure tokens aren't renewed in the background: about once per token lifetime, a request waits for sign-in.
+- Sovereign clouds (Azure Government, Azure China) are untested. `<NAME>_TOKEN_SCOPE` should make them work.
+- Managed identity hasn't been checked end to end in Azure yet: VMs, App Service, Container Apps and AKS were tested only against simulated Azure replies.
+- There are no retries, response caching or embeddings endpoint yet.
 
 ## Development
 
@@ -337,6 +405,7 @@ CI runs the same checks on every push and pull request to `main`. The tests star
 | `src/main.rs` | Startup: `.env`, configuration, logging, stats, server, final save. |
 | `src/app.rs` | Shared state, routes and middleware order. |
 | `src/config/` | Environment variables and their validation. |
+| `src/sign_in/` | Azure sign-in: credentials, the token cache and the HTTP transport they share with upstream requests. |
 | `src/auth.rs` | Key hashing, key IDs, roles and the auth middleware. |
 | `src/rate_limit.rs` | Per-key token buckets. |
 | `src/proxy/` | Routing, the upstream client, SSE relay, fallback and `/v1/models`. |
@@ -356,9 +425,9 @@ CI runs the same checks on every push and pull request to `main`. The tests star
 | Fallback, including streaming | Done |
 | Usage stats per key, saved atomically | Done |
 | Docker image | Done |
+| Azure OpenAI, with keyless sign-in | Done |
 | Retries with backoff | Planned |
 | Embeddings endpoint | Planned |
-| Azure OpenAI | Planned |
 | Response caching | Planned |
 
 ---
