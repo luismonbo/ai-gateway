@@ -4,6 +4,7 @@
 use super::upstream::{describe_failure, send_models};
 use crate::app::AppState;
 use crate::config::Upstream;
+use actix_web::rt::time::timeout;
 use actix_web::{web, HttpResponse};
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
@@ -90,6 +91,24 @@ async fn upstream_models(state: &AppState, upstream: &Upstream) -> Vec<ModelEntr
     if let Some(models) = &upstream.models {
         return listed_models(&upstream.name, models);
     }
+    // One bound for the whole answer, signing in included. Giving up drops
+    // a sign-in in progress, which leaves the token cache as it was.
+    let bound = state.config.connect_timeout;
+    match timeout(bound, asked_models(state, upstream)).await {
+        Ok(models) => models,
+        Err(_elapsed) => {
+            warn!(
+                upstream = %upstream.name,
+                "the upstream's models took longer than UPSTREAM_CONNECT_TIMEOUT_SECS; \
+                 leaving them out"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Signs in if the upstream needs it, then asks it for its list.
+async fn asked_models(state: &AppState, upstream: &Upstream) -> Vec<ModelEntry> {
     let bearer = match state.sign_in.bearer(upstream).await {
         Ok(bearer) => bearer,
         Err(e) => {

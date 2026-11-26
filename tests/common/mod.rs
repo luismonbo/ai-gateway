@@ -79,13 +79,21 @@ pub const SIGN_IN_FAILURE: &str = "fake sign-in failure: please run 'az login'";
 #[derive(Debug)]
 pub struct FakeCredential {
     token: Option<String>,
+    /// How long each call takes.
+    delay: std::time::Duration,
     calls: AtomicUsize,
 }
 
 impl FakeCredential {
     pub fn ok(token: &str) -> Arc<Self> {
+        Self::slow(token, std::time::Duration::ZERO)
+    }
+
+    /// Like [`FakeCredential::ok`], taking `delay` to answer.
+    pub fn slow(token: &str, delay: std::time::Duration) -> Arc<Self> {
         Arc::new(Self {
             token: Some(token.to_string()),
+            delay,
             calls: AtomicUsize::new(0),
         })
     }
@@ -93,6 +101,7 @@ impl FakeCredential {
     pub fn failing() -> Arc<Self> {
         Arc::new(Self {
             token: None,
+            delay: std::time::Duration::ZERO,
             calls: AtomicUsize::new(0),
         })
     }
@@ -111,6 +120,9 @@ impl TokenCredential for FakeCredential {
         _options: Option<TokenRequestOptions<'_>>,
     ) -> azure_core::Result<AccessToken> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if !self.delay.is_zero() {
+            actix_web::rt::time::sleep(self.delay).await;
+        }
         match &self.token {
             Some(token) => Ok(AccessToken::new(
                 token.clone(),

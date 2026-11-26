@@ -151,3 +151,24 @@ async fn lists_configured_models_without_asking_the_upstream() {
     assert!(primary.received_requests().await.unwrap().is_empty());
     assert_eq!(credential.calls(), 0);
 }
+
+#[actix_web::test]
+async fn signing_in_counts_toward_an_upstreams_time() {
+    // Signing in and listing take 0.7 s each: either fits the 1 s bound,
+    // but together they don't, so the slow upstream is left out.
+    let primary = upstream_listing(&["a"], Duration::from_millis(700)).await;
+    let backup = upstream_listing(&["c"], Duration::ZERO).await;
+    let (primary_url, backup_url) = (mock_url(&primary), mock_url(&backup));
+    let config = config(&[
+        ("PRIMARY_BASE_URL", &primary_url),
+        ("PRIMARY_AUTH", "azure_cli"),
+        ("BACKUP_BASE_URL", &backup_url),
+        ("UPSTREAM_CONNECT_TIMEOUT_SECS", "1"),
+    ]);
+    let credential = FakeCredential::slow("tok-1", Duration::from_millis(700));
+    let app = init(state_with_credentials(config, &[("primary", credential)])).await;
+
+    let response = test::call_service(&app, get_models()).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(ids(&json_body(response).await), ["backup/c"]);
+}
