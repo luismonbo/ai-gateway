@@ -214,15 +214,21 @@ enum Attempt {
     Stream(reqwest::Response),
 }
 
-/// Sends `body` to `upstream`. A non-streaming answer is read in full here,
-/// so a failure while reading it is still a failure (and can fall back).
+/// Sends `body` to `upstream`, with its key or Azure token. A non-streaming
+/// answer is read in full here, so a failure while reading it is still a
+/// failure (and can fall back).
 async fn attempt(
     state: &AppState,
     upstream: &Upstream,
     body: Vec<u8>,
     stream: bool,
 ) -> Result<Attempt, UpstreamFailure> {
-    let response = send_chat(&state.http, upstream, body).await?;
+    let bearer = state
+        .sign_in
+        .bearer(upstream)
+        .await
+        .map_err(|e| UpstreamFailure::SignIn(e.to_string()))?;
+    let response = send_chat(&state.http, upstream, bearer.as_ref(), body).await?;
     if stream {
         return Ok(Attempt::Stream(response));
     }

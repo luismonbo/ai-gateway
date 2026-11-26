@@ -4,8 +4,9 @@
 //! actix-web uses the `http` 0.2 types and reqwest the 1.x ones, so status
 //! codes and header values are converted by their numbers and bytes.
 
-use crate::config::{Config, Upstream, UpstreamKey};
+use crate::config::{Config, Upstream};
 use crate::error::ApiError;
+use crate::sign_in::Bearer;
 use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::http::StatusCode;
 use actix_web::{HttpResponse, ResponseError};
@@ -42,8 +43,11 @@ pub enum UpstreamFailure {
         status: StatusCode,
         retry_after: Option<HeaderValue>,
         content_type: Option<HeaderValue>,
+        /// Already scrubbed of the secret the request carried.
         body: Bytes,
     },
+    /// No Azure token could be had, so nothing was sent; the text is why.
+    SignIn(String),
 }
 
 /// Never shows the body: it may hold fragments of the upstream key.
@@ -53,6 +57,7 @@ impl fmt::Display for UpstreamFailure {
             UpstreamFailure::Unreachable(reason) => write!(f, "could not connect: {reason}"),
             UpstreamFailure::Timeout => f.write_str("timed out"),
             UpstreamFailure::Status { status, .. } => write!(f, "returned HTTP {status}"),
+            UpstreamFailure::SignIn(reason) => write!(f, "could not sign in: {reason}"),
         }
     }
 }
@@ -77,54 +82,63 @@ impl fmt::Debug for UpstreamFailure {
                 .field("content_type", content_type)
                 .field("body", &format_args!("<{} bytes>", body.len()))
                 .finish(),
+            UpstreamFailure::SignIn(reason) => f.debug_tuple("SignIn").field(reason).finish(),
         }
     }
 }
 
-/// `POST {base_url}/chat/completions` with `body`, sending the upstream's
-/// own key if it has one. No client header is forwarded.
+/// `POST {base_url}/chat/completions` with `body`, sending `bearer`: the
+/// upstream's own key or its Azure token. No client header is forwarded.
 pub async fn send_chat(
     client: &reqwest::Client,
     upstream: &Upstream,
+    bearer: Option<&Bearer>,
     body: Vec<u8>,
 ) -> Result<reqwest::Response, UpstreamFailure> {
     let request = client
         .post(upstream.chat_url())
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(body);
-    send(authorized(request, upstream), upstream).await
+    send(authorized(request, bearer), upstream, bearer).await
 }
 
-/// `GET {base_url}/models`, read in full. `timeout` bounds the whole
-/// request, so one slow upstream can't hold up the combined list.
+/// `GET {base_url}/models`, read in full, sending `bearer`. `timeout`
+/// bounds the whole request, so one slow upstream can't hold up the
+/// combined list.
 pub async fn send_models(
     client: &reqwest::Client,
     upstream: &Upstream,
+    bearer: Option<&Bearer>,
     timeout: Duration,
 ) -> Result<Bytes, UpstreamFailure> {
-    let request = authorized(client.get(upstream.models_url()), upstream).timeout(timeout);
-    read_body(send(request, upstream).await?).await
+    let request = authorized(client.get(upstream.models_url()), bearer).timeout(timeout);
+    read_body(send(request, upstream, bearer).await?).await
 }
 
-/// Adds the upstream's own key, if it has one. `bearer_auth` also marks
-/// the header as sensitive.
-fn authorized(request: reqwest::RequestBuilder, upstream: &Upstream) -> reqwest::RequestBuilder {
-    match &upstream.api_key {
-        Some(key) => request.bearer_auth(key.expose()),
+/// Adds the bearer, if there is one. `bearer_auth` also marks the header
+/// as sensitive.
+fn authorized(
+    request: reqwest::RequestBuilder,
+    bearer: Option<&Bearer>,
+) -> reqwest::RequestBuilder {
+    match bearer {
+        Some(bearer) => request.bearer_auth(bearer.expose()),
         None => request,
     }
 }
 
-/// Sends `request`; anything but a 2xx answer is a failure.
+/// Sends `request`; anything but a 2xx answer is a failure, whose body is
+/// scrubbed of `bearer` before anything else sees it.
 async fn send(
     request: reqwest::RequestBuilder,
     upstream: &Upstream,
+    bearer: Option<&Bearer>,
 ) -> Result<reqwest::Response, UpstreamFailure> {
     let response = request.send().await.map_err(classify)?;
     if response.status().is_success() {
         Ok(response)
     } else {
-        Err(status_failure(&upstream.name, response).await)
+        Err(status_failure(&upstream.name, response, bearer.map(Bearer::expose)).await)
     }
 }
 
@@ -134,25 +148,27 @@ pub async fn read_body(response: reqwest::Response) -> Result<Bytes, UpstreamFai
 }
 
 /// Connection errors, timeouts, 5xx and 429 are worth retrying elsewhere.
-/// Other statuses are the client's or the operator's mistake.
+/// Other statuses, and failing to sign in, are the client's or the
+/// operator's mistake, which a fallback would hide.
 pub fn should_fallback(failure: &UpstreamFailure) -> bool {
     match failure {
         UpstreamFailure::Unreachable(_) | UpstreamFailure::Timeout => true,
         UpstreamFailure::Status { status, .. } => {
             status.is_server_error() || *status == StatusCode::TOO_MANY_REQUESTS
         }
+        UpstreamFailure::SignIn(_) => false,
     }
 }
 
 /// What the client gets. Bodies of 401, 403, 429 and 5xx responses are
 /// never returned; other 4xx bodies explain the client's mistake and pass
-/// through unchanged.
+/// through, already scrubbed of the request's secret.
 pub fn failure_response(upstream: &Upstream, failure: &UpstreamFailure) -> HttpResponse {
-    let key = upstream.api_key.as_ref().map(UpstreamKey::expose);
     let upstream = upstream.name.as_str();
     let error = match failure {
         UpstreamFailure::Unreachable(_) => ApiError::upstream_unavailable(upstream),
         UpstreamFailure::Timeout => ApiError::upstream_timeout(upstream),
+        UpstreamFailure::SignIn(_) => ApiError::upstream_auth_failed(upstream),
         UpstreamFailure::Status {
             status,
             retry_after,
@@ -161,81 +177,85 @@ pub fn failure_response(upstream: &Upstream, failure: &UpstreamFailure) -> HttpR
         } => match status.as_u16() {
             401 | 403 => ApiError::upstream_auth_failed(upstream),
             429 => ApiError::upstream_rate_limited(upstream, retry_after.clone()),
-            400..=499 => return passed_through(*status, content_type.as_ref(), body, key),
+            400..=499 => return passed_through(*status, content_type.as_ref(), body),
             _ => ApiError::upstream_error(upstream),
         },
     };
     error.error_response()
 }
 
-/// The upstream's own 4xx answer, with its key replaced by `[redacted]` in
-/// case the upstream echoed it.
+/// The upstream's own 4xx answer.
 fn passed_through(
     status: StatusCode,
     content_type: Option<&HeaderValue>,
     body: &Bytes,
-    key: Option<&str>,
 ) -> HttpResponse {
-    let leaks_key = key.is_some_and(|key| {
-        !key.is_empty()
-            && body
-                .windows(key.len())
-                .any(|window| window == key.as_bytes())
-    });
-    let body = if leaks_key {
-        Bytes::from(redacted(body, key, usize::MAX))
-    } else {
-        body.clone()
-    };
     match content_type {
         Some(content_type) => HttpResponse::build(status)
             .insert_header((CONTENT_TYPE, content_type.clone()))
-            .body(body),
-        None => HttpResponse::build(status).body(body),
+            .body(body.clone()),
+        None => HttpResponse::build(status).body(body.clone()),
     }
 }
 
-/// For logs: the failure plus the start of any body, with the upstream's
-/// key replaced by `[redacted]`.
+/// For logs: the failure, a hint when an Azure upstream rejected its token,
+/// and the start of any body.
 pub fn describe_failure(upstream: &Upstream, failure: &UpstreamFailure) -> String {
+    let hint = sign_in_hint(upstream, failure);
     match failure {
         UpstreamFailure::Status { body, .. } if !body.is_empty() => {
-            let key = upstream.api_key.as_ref().map(UpstreamKey::expose);
-            format!("{failure}; body: {}", body_excerpt(body, key))
+            format!("{failure}{hint}; body: {}", body_excerpt(body))
         }
-        _ => failure.to_string(),
+        _ => format!("{failure}{hint}"),
     }
 }
 
-/// The first [`LOGGED_BODY_BYTES`] of `body`, with the upstream's key
-/// redacted, as lossy UTF-8 with control characters escaped, so the excerpt
-/// stays on one log line and can't fake another.
-fn body_excerpt(body: &[u8], key: Option<&str>) -> String {
-    let start = redacted(body, key, LOGGED_BODY_BYTES);
-    let text = String::from_utf8_lossy(&start[..start.len().min(LOGGED_BODY_BYTES)]);
-    escape_controls(&text)
+/// What to check when an upstream that signs in to Azure answers 401 or 403.
+fn sign_in_hint(upstream: &Upstream, failure: &UpstreamFailure) -> String {
+    let UpstreamFailure::Status { status, .. } = failure else {
+        return String::new();
+    };
+    if upstream.sign_in.is_none() {
+        return String::new();
+    }
+    match status.as_u16() {
+        401 => format!(
+            "; check that the base URL uses the resource's custom subdomain, or try \
+             {}_TOKEN_SCOPE=https://cognitiveservices.azure.com/.default",
+            upstream.name.to_ascii_uppercase()
+        ),
+        403 => "; give the identity the Cognitive Services OpenAI User role on the resource \
+                (it can take 5 minutes to apply) and check the tenant"
+            .to_string(),
+        _ => String::new(),
+    }
 }
 
-/// `body` with every copy of `key` replaced by `[redacted]`, read until the
-/// result holds `limit` bytes. Matching while reading means a copy that
-/// starts before the limit is always replaced whole, however many came first.
-fn redacted(body: &[u8], key: Option<&str>, limit: usize) -> Vec<u8> {
-    let key = key.map(str::as_bytes).filter(|key| !key.is_empty());
-    let mut out = Vec::with_capacity(body.len().min(limit));
+/// The first [`LOGGED_BODY_BYTES`] of `body`, as lossy UTF-8 with control
+/// characters escaped, so the excerpt stays on one log line and can't fake
+/// another.
+fn body_excerpt(body: &[u8]) -> String {
+    let start = &body[..body.len().min(LOGGED_BODY_BYTES)];
+    escape_controls(&String::from_utf8_lossy(start))
+}
+
+/// `body` with every copy of `secret` replaced by `[redacted]`.
+fn redacted(body: &[u8], secret: Option<&str>) -> Vec<u8> {
+    let Some(secret) = secret
+        .map(str::as_bytes)
+        .filter(|secret| !secret.is_empty())
+    else {
+        return body.to_vec();
+    };
+    let mut out = Vec::with_capacity(body.len());
     let mut rest = body;
-    while out.len() < limit {
-        let Some((&byte, after)) = rest.split_first() else {
-            break;
-        };
-        match key {
-            Some(key) if rest.starts_with(key) => {
-                out.extend_from_slice(REDACTED.as_bytes());
-                rest = &rest[key.len()..];
-            }
-            _ => {
-                out.push(byte);
-                rest = after;
-            }
+    while let Some((&byte, after)) = rest.split_first() {
+        if rest.starts_with(secret) {
+            out.extend_from_slice(REDACTED.as_bytes());
+            rest = &rest[secret.len()..];
+        } else {
+            out.push(byte);
+            rest = after;
         }
     }
     out
@@ -272,7 +292,13 @@ fn error_chain(error: &(dyn Error + 'static)) -> String {
         .join(": ")
 }
 
-async fn status_failure(upstream: &str, response: reqwest::Response) -> UpstreamFailure {
+/// A non-2xx answer. Its body is scrubbed of `secret`, the key or token the
+/// request carried, here, so no log line or client response can repeat it.
+async fn status_failure(
+    upstream: &str,
+    response: reqwest::Response,
+    secret: Option<&str>,
+) -> UpstreamFailure {
     let status = status(&response);
     let retry_after = header(&response, reqwest::header::RETRY_AFTER);
     let content_type = header(&response, reqwest::header::CONTENT_TYPE);
@@ -290,7 +316,7 @@ async fn status_failure(upstream: &str, response: reqwest::Response) -> Upstream
         status,
         retry_after,
         content_type,
-        body,
+        body: Bytes::from(redacted(&body, secret)),
     }
 }
 

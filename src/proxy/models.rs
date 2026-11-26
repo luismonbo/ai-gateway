@@ -72,7 +72,19 @@ pub async fn list_models(state: web::Data<AppState>) -> HttpResponse {
 }
 
 async fn upstream_models(state: &AppState, upstream: &Upstream) -> Vec<ModelEntry> {
-    let body = match send_models(&state.http, upstream, state.config.connect_timeout).await {
+    let bearer = match state.sign_in.bearer(upstream).await {
+        Ok(bearer) => bearer,
+        Err(e) => {
+            warn!(
+                upstream = %upstream.name,
+                error = %e,
+                "could not sign in; leaving its models out"
+            );
+            return Vec::new();
+        }
+    };
+    let timeout = state.config.connect_timeout;
+    let body = match send_models(&state.http, upstream, bearer.as_ref(), timeout).await {
         Ok(body) => body,
         Err(failure) => {
             warn!(
