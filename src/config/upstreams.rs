@@ -20,6 +20,9 @@ pub struct Upstream {
     /// From `<NAME>_AUTH`: the upstream gets Azure tokens instead of a key.
     pub sign_in: Option<AzureSignIn>,
     pub fallback: Option<FallbackTarget>,
+    /// From `<NAME>_MODELS`: what `/v1/models` lists for this upstream,
+    /// without asking it. `None` lists the upstream's own models.
+    pub models: Option<Vec<String>>,
 }
 
 impl Upstream {
@@ -109,18 +112,21 @@ fn upstream_names(env: &Env) -> Result<Vec<String>, ConfigError> {
             ),
         ));
     }
-    // A name is repeated when it already appears earlier in the list.
-    let repeated = names
-        .iter()
-        .enumerate()
-        .find(|(i, name)| names[..*i].contains(name));
-    if let Some((_, repeated)) = repeated {
+    if let Some(repeated) = first_repeat(&names) {
         return Err(ConfigError::new(
             UPSTREAMS,
             format!("{repeated:?} is listed more than once"),
         ));
     }
     Ok(names)
+}
+
+/// The first entry that already appears earlier in `list`.
+fn first_repeat(list: &[String]) -> Option<&String> {
+    list.iter()
+        .enumerate()
+        .find(|(i, entry)| list[..*i].contains(entry))
+        .map(|(_, entry)| entry)
 }
 
 fn is_valid_name(name: &str) -> bool {
@@ -147,15 +153,50 @@ fn upstream(
     });
     let api_key = env.get(&key_variable).map(UpstreamKey);
     let (sign_in, sign_in_warnings) = azure::sign_in(env, &prefix, &url, api_key.is_some())?;
+    let fallback = fallback(env, &format!("{prefix}_FALLBACK"), names)?;
+    let (models, model_warnings) = models(env, &format!("{prefix}_MODELS"), name)?;
     let upstream = Upstream {
         name: name.to_string(),
         base_url: url.as_str().trim_end_matches('/').to_string(),
         api_key,
         sign_in,
-        fallback: fallback(env, &format!("{prefix}_FALLBACK"), names)?,
+        fallback,
+        models,
     };
-    let warnings = path_warning.into_iter().chain(sign_in_warnings).collect();
+    let warnings = path_warning
+        .into_iter()
+        .chain(sign_in_warnings)
+        .chain(model_warnings)
+        .collect();
     Ok((upstream, warnings))
+}
+
+/// The upstream's `<NAME>_MODELS` list, `None` when unset or empty, and a
+/// warning for each entry that repeats the `<name>/` prefix.
+fn models(
+    env: &Env,
+    variable: &str,
+    name: &str,
+) -> Result<(Option<Vec<String>>, Vec<String>), ConfigError> {
+    let models = env.list(variable);
+    if let Some(repeated) = first_repeat(&models) {
+        return Err(ConfigError::new(
+            variable,
+            format!("{repeated:?} is listed more than once"),
+        ));
+    }
+    let prefix = format!("{name}/");
+    let warnings = models
+        .iter()
+        .filter(|model| model.starts_with(&prefix))
+        .map(|model| {
+            format!(
+                "{variable}: {model:?} already starts with {prefix:?}; the gateway adds the \
+                 prefix itself"
+            )
+        })
+        .collect();
+    Ok(((!models.is_empty()).then_some(models), warnings))
 }
 
 /// An http(s) URL with no credentials, query string or fragment.

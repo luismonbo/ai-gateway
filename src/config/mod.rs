@@ -133,7 +133,7 @@ impl Config {
         let address = format!("bind address: {}:{}", self.host, self.port);
         let upstreams = self.upstreams.iter().map(|upstream| {
             format!(
-                "upstream {}: {} (auth: {}, fallback: {})",
+                "upstream {}: {} (auth: {}, fallback: {}{})",
                 upstream.name,
                 upstream.base_url,
                 auth_label(upstream),
@@ -141,6 +141,7 @@ impl Config {
                     .fallback
                     .as_ref()
                     .map_or_else(|| "none".to_string(), ToString::to_string),
+                models_label(upstream),
             )
         });
         let default_upstream = format!(
@@ -183,6 +184,17 @@ fn auth_label(upstream: &Upstream) -> String {
         (None, Some(_)) => "api key".to_string(),
         (None, None) => "none".to_string(),
     }
+}
+
+/// Where `/v1/models` gets this upstream's list, when it isn't the upstream.
+fn models_label(upstream: &Upstream) -> String {
+    upstream.models.as_ref().map_or_else(String::new, |models| {
+        format!(
+            ", models: {} from {}_MODELS",
+            models.len(),
+            upstream.name.to_ascii_uppercase()
+        )
+    })
 }
 
 /// Variable lookup where a blank value counts as unset.

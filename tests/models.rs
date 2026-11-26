@@ -2,9 +2,11 @@ mod common;
 
 use actix_web::test::{self, TestRequest};
 use common::{
-    bearer, closed_port_url, config, init, json_body, mock_url, state, UPSTREAM_KEY, USER_KEY,
+    bearer, closed_port_url, config, init, json_body, mock_url, state, state_with_credentials,
+    FakeCredential, UPSTREAM_KEY, USER_KEY,
 };
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::Duration;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -119,4 +121,33 @@ async fn requires_a_gateway_key() {
         json_body(response).await["error"]["code"],
         "invalid_api_key"
     );
+}
+
+#[actix_web::test]
+async fn lists_configured_models_without_asking_the_upstream() {
+    // Azure's own list holds models it could deploy, not its deployments.
+    let primary = upstream_listing(&["not-a-deployment"], Duration::ZERO).await;
+    let backup = upstream_listing(&["c"], Duration::ZERO).await;
+    let (primary_url, backup_url) = (mock_url(&primary), mock_url(&backup));
+    let credential = FakeCredential::failing();
+    let config = config(&[
+        ("PRIMARY_BASE_URL", &primary_url),
+        ("PRIMARY_AUTH", "azure_cli"),
+        ("PRIMARY_MODELS", "dep-a,dep-b"),
+        ("BACKUP_BASE_URL", &backup_url),
+    ]);
+    let app = init(state_with_credentials(
+        config,
+        &[("primary", Arc::clone(&credential))],
+    ))
+    .await;
+
+    let response = test::call_service(&app, get_models()).await;
+    assert_eq!(response.status(), 200);
+    let list = json_body(response).await;
+    assert_eq!(ids(&list), ["primary/dep-a", "primary/dep-b", "backup/c"]);
+    assert_eq!(list["data"][0]["owned_by"], "primary");
+    // The upstream wasn't asked, so its failing sign-in never mattered.
+    assert!(primary.received_requests().await.unwrap().is_empty());
+    assert_eq!(credential.calls(), 0);
 }

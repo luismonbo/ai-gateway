@@ -206,3 +206,63 @@ fn fallback_errors_name_no_model() {
     assert!(err.message.contains("<upstream>/<model>"), "{err}");
     assert!(!err.message.contains("gpt"), "names a model: {err}");
 }
+
+const AZURE_URL: &str = "https://res.openai.azure.com/openai/v1";
+
+#[test]
+fn models_list_is_parsed() {
+    let (config, warnings) = load(&[
+        ("UPSTREAMS", "azure,ollama"),
+        ("AZURE_BASE_URL", AZURE_URL),
+        ("AZURE_MODELS", " gpt-4o-prod, ,gpt-5-mini "),
+        ("OLLAMA_BASE_URL", OLLAMA_URL),
+    ])
+    .unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(
+        config.upstream("azure").unwrap().models,
+        Some(vec!["gpt-4o-prod".to_string(), "gpt-5-mini".to_string()])
+    );
+    assert_eq!(config.upstream("ollama").unwrap().models, None);
+    let summary = config.summary_lines().join("\n");
+    assert!(summary.contains("models: 2 from AZURE_MODELS"), "{summary}");
+    assert_eq!(summary.matches("models:").count(), 1, "{summary}");
+
+    // Only blank entries is the same as unset.
+    let (config, _) = load(&[
+        ("UPSTREAMS", "azure"),
+        ("AZURE_BASE_URL", AZURE_URL),
+        ("AZURE_MODELS", " , "),
+    ])
+    .unwrap();
+    assert_eq!(config.upstream("azure").unwrap().models, None);
+}
+
+#[test]
+fn models_list_rejects_duplicates() {
+    let err = load(&[
+        ("UPSTREAMS", "azure"),
+        ("AZURE_BASE_URL", AZURE_URL),
+        ("AZURE_MODELS", "a,b,a"),
+    ])
+    .unwrap_err();
+    assert_eq!(err.variable, "AZURE_MODELS");
+    assert!(err.message.contains("\"a\""), "{err}");
+}
+
+#[test]
+fn prefixed_model_entries_warn() {
+    let (config, warnings) = load(&[
+        ("UPSTREAMS", "azure"),
+        ("AZURE_BASE_URL", AZURE_URL),
+        ("AZURE_MODELS", "azure/x"),
+    ])
+    .unwrap();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("AZURE_MODELS"), "{warnings:?}");
+    // Kept as written: a model may really be called that.
+    assert_eq!(
+        config.upstream("azure").unwrap().models,
+        Some(vec!["azure/x".to_string()])
+    );
+}

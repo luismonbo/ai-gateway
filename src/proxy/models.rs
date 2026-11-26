@@ -55,8 +55,22 @@ pub fn prefix_models(upstream: &str, body: &[u8]) -> Result<Vec<ModelEntry>, ser
     Ok(models)
 }
 
-/// Asks every upstream at once. An upstream that fails is logged and left
-/// out, so the answer is always 200.
+/// The models from `<NAME>_MODELS`, named `{upstream}/{model}` and owned by
+/// the upstream. Nothing says when they were created, so `created` is 0.
+pub fn listed_models(upstream: &str, models: &[String]) -> Vec<ModelEntry> {
+    models
+        .iter()
+        .map(|model| ModelEntry {
+            id: format!("{upstream}/{model}"),
+            object: "model",
+            created: 0,
+            owned_by: upstream.to_string(),
+        })
+        .collect()
+}
+
+/// Asks every upstream at once, except those whose list is configured. An
+/// upstream that fails is logged and left out, so the answer is always 200.
 pub async fn list_models(state: web::Data<AppState>) -> HttpResponse {
     let lists = state
         .config
@@ -72,6 +86,10 @@ pub async fn list_models(state: web::Data<AppState>) -> HttpResponse {
 }
 
 async fn upstream_models(state: &AppState, upstream: &Upstream) -> Vec<ModelEntry> {
+    // A configured list needs no request, so no token either.
+    if let Some(models) = &upstream.models {
+        return listed_models(&upstream.name, models);
+    }
     let bearer = match state.sign_in.bearer(upstream).await {
         Ok(bearer) => bearer,
         Err(e) => {
@@ -129,6 +147,20 @@ mod tests {
         let models = prefix_models("vllm", body).unwrap();
         assert_eq!(models.len(), 4);
         assert!(models.iter().all(|model| model.created == 0), "{models:?}");
+    }
+
+    #[test]
+    fn listed_models_are_prefixed_and_owned() {
+        let entry = |id: &str| ModelEntry {
+            id: id.to_string(),
+            object: "model",
+            created: 0,
+            owned_by: "azure".to_string(),
+        };
+        assert_eq!(
+            listed_models("azure", &["a".to_string(), "b".to_string()]),
+            [entry("azure/a"), entry("azure/b")]
+        );
     }
 
     #[test]
