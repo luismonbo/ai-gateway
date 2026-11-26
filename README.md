@@ -111,9 +111,8 @@ The gateway checks the configuration before it starts, and the first broken rule
 - `<NAME>_AUTH` is `managed_identity` or `azure_cli`, in any letter case, and can't be set together with `<NAME>_API_KEY`.
 - `<NAME>_CLIENT_ID` must be a GUID. With `azure_cli`, or without `<NAME>_AUTH`, it's ignored with a warning, because a shell may export `AZURE_CLIENT_ID` for other tools.
 - `<NAME>_TOKEN_SCOPE` must be an `https://` URL. Without `<NAME>_AUTH` it's ignored with a warning.
-- With `<NAME>_AUTH`, the base URL must start with `https://`, so tokens never travel in clear text; `http://` is accepted only for `localhost` and loopback addresses. A host outside `*.openai.azure.com`, `*.services.ai.azure.com` and `*.cognitiveservices.azure.com`, such as an API Management proxy, gets a warning that tokens will be sent there.
+- With `<NAME>_AUTH`, the base URL must start with `https://`, so tokens never travel in clear text; `http://` is accepted only for `localhost` and loopback addresses. Any other host outside `*.openai.azure.com`, `*.services.ai.azure.com` and `*.cognitiveservices.azure.com`, such as an API Management proxy, gets a warning that tokens will be sent there.
 - A model listed twice in `<NAME>_MODELS` is an error. An entry that already starts with `<name>/` gets a warning, because the gateway adds the prefix itself.
-- A managed identity the Azure libraries can't use here stops startup with their reason: on Azure Arc, Service Fabric, Cloud Shell or Azure ML, or AKS workload identity without `AZURE_TENANT_ID`.
 - At least one gateway key is required, and a key can't be both a user key and an admin key. Keys shorter than 32 characters get a warning.
 - Numbers must be whole and greater than 0, and `PORT` must fit in 16 bits.
 
@@ -165,10 +164,22 @@ AZURE_MODELS=my-gpt4o,my-gpt5-mini   # your deployment names, for /v1/models
 
 If your account is in several tenants, sign in to the resource's tenant: `az login --tenant <tenant ID>`. The Docker image has no Azure CLI, so `azure_cli` works only outside it, for example with `cargo run`.
 
-**`managed_identity`** signs in as the Azure resource the gateway runs on. The gateway works out the platform from what Azure sets in its environment:
+**`managed_identity`** signs in as the Azure resource the gateway runs on, for example:
+
+```ini
+UPSTREAMS=azure
+AZURE_BASE_URL=https://my-resource.openai.azure.com/openai/v1
+AZURE_AUTH=managed_identity
+# AZURE_CLIENT_ID=<client ID>   # only for a user-assigned identity
+AZURE_MODELS=my-gpt4o,my-gpt5-mini
+```
+
+The same settings work on every platform; the gateway works out which one it's on from what Azure sets in its environment:
 
 - **VMs and scale sets, App Service, Functions and Container Apps:** the system-assigned identity, or a user-assigned one with `<NAME>_CLIENT_ID=<its client ID>`.
 - **AKS with workload identity:** when the pod is set up for it (`AZURE_FEDERATED_TOKEN_FILE` is set), the gateway signs in as the pod's identity, using the `AZURE_CLIENT_ID` the webhook sets unless `<NAME>_CLIENT_ID` names another.
+
+Where the Azure libraries can't use a managed identity (Azure Arc, Service Fabric, Cloud Shell and Azure ML), or AKS workload identity lacks `AZURE_TENANT_ID`, startup stops with a message naming the upstream and the reason.
 
 Before the first request:
 
@@ -197,7 +208,7 @@ How it behaves:
 | 502 `upstream_auth_failed`, and the log says `returned HTTP 403` | Give the identity the Cognitive Services OpenAI User role on the resource; a new assignment takes up to 5 minutes. Check that you signed in to the resource's tenant. |
 | 404 from Azure | `model` must be a deployment name, not the name of the model behind it. |
 | Startup warning `could not sign in with …` | The reason follows. With `azure_cli`: install the Azure CLI or run `az login`. With `managed_identity`: give the resource an identity, and check `<NAME>_CLIENT_ID`. |
-| `no token within …; raise UPSTREAM_CONNECT_TIMEOUT_SECS if signing in is slow` | Signing in took longer than `UPSTREAM_CONNECT_TIMEOUT_SECS` (10 s by default). Raise it if `az` is slow on this machine. |
+| `no token within …; raise UPSTREAM_CONNECT_TIMEOUT_SECS if signing in is slow` | Signing in took longer than `UPSTREAM_CONNECT_TIMEOUT_SECS` (10 s by default). With `azure_cli`, raise it if `az` is slow on this machine. With `managed_identity`, it usually means nothing answered at Azure's identity endpoint: the gateway isn't running in Azure, or the resource has no identity. Raising the timeout won't help then. |
 
 ## Endpoints
 
@@ -257,7 +268,7 @@ curl http://localhost:8080/v1/models -H "Authorization: Bearer $GATEWAY_KEY"
 ]}
 ```
 
-Upstreams are asked at the same time, and each gets `UPSTREAM_CONNECT_TIMEOUT_SECS` (10 s by default) for its whole answer, so one hanging upstream can't hold up the list. An upstream that fails, or can't get an Azure token, is left out and logged; the response is still 200. An upstream with `<NAME>_MODELS` isn't asked at all: its configured names are listed, in the order written, with `created` set to 0.
+Upstreams are asked at the same time, and each gets `UPSTREAM_CONNECT_TIMEOUT_SECS` (10 s by default) for its whole answer, signing in to Azure included, so one hanging upstream can't hold up the list. An upstream that fails, or can't get an Azure token, is left out and logged; the response is still 200. An upstream with `<NAME>_MODELS` isn't asked at all: its configured names are listed, in the order written, with `created` set to 0.
 
 ### `GET /v1/stats`
 
