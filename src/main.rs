@@ -3,6 +3,7 @@ use ai_gateway::app::{build_app, AppState};
 use ai_gateway::config::{Config, LogFormat};
 use ai_gateway::logging::init_logging;
 use ai_gateway::stats::{spawn_flusher, LoadOutcome, StatsStore};
+use azure_core::time::OffsetDateTime;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -73,6 +74,7 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    log_sign_in(&state).await;
 
     let address = (state.config.host.clone(), state.config.port);
     let server = HttpServer::new(move || build_app(state.clone())).bind(address.clone());
@@ -100,6 +102,30 @@ async fn main() -> ExitCode {
         Err(e) => {
             error!("server error: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Signs in to each Azure upstream once, so a problem shows at startup. A
+/// failure only warns: the other upstreams work, and this one's requests
+/// fail until it can sign in.
+async fn log_sign_in(state: &AppState) {
+    for (name, result) in state.sign_in.check().await {
+        let method = state
+            .config
+            .upstream(&name)
+            .and_then(|upstream| upstream.sign_in.as_ref())
+            .map(|sign_in| sign_in.method.to_string())
+            .unwrap_or_default();
+        match result {
+            Ok(expires_on) => {
+                let minutes = (expires_on - OffsetDateTime::now_utc()).whole_minutes();
+                info!("upstream {name}: signed in with {method}; token valid for {minutes} min");
+            }
+            Err(e) => warn!(
+                "upstream {name}: could not sign in with {method}: {e}; its requests fail \
+                 until it can"
+            ),
         }
     }
 }

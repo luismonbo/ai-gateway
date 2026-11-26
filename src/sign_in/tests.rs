@@ -136,3 +136,38 @@ fn bearer_debug_is_redacted() {
     let key = format!("{:?}", Bearer::Key(key));
     assert!(!key.contains(UPSTREAM_KEY), "{key}");
 }
+
+#[actix_web::test]
+async fn check_signs_in_once_per_azure_upstream() {
+    let config = config(&[
+        ("GATEWAY_API_KEYS", GATEWAY_KEY),
+        ("UPSTREAMS", "a,keyed,b"),
+        ("A_BASE_URL", LOOPBACK),
+        ("A_AUTH", "azure_cli"),
+        ("KEYED_BASE_URL", LOOPBACK),
+        ("KEYED_API_KEY", UPSTREAM_KEY),
+        ("B_BASE_URL", LOOPBACK),
+        ("B_AUTH", "azure_cli"),
+    ]);
+    let expires_on = in_an_hour();
+    let a = ScriptedCredential::new(vec![Ok(("tok-a", expires_on))], Duration::ZERO);
+    let b = ScriptedCredential::new(vec![Err("az: please run 'az login'")], Duration::ZERO);
+    let (a_dyn, b_dyn): (Arc<dyn TokenCredential>, Arc<dyn TokenCredential>) =
+        (a.clone(), b.clone());
+    // Handed over in another order: results follow UPSTREAMS.
+    let sign_in = SignIn::with_credentials(&config, vec![("b".into(), b_dyn), ("a".into(), a_dyn)]);
+
+    let results = sign_in.check().await;
+    let names: Vec<&str> = results.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["a", "b"]);
+    assert_eq!(results[0].1, Ok(expires_on));
+    assert!(
+        matches!(&results[1].1, Err(SignInError::Token(m)) if m.contains("az login")),
+        "{results:?}"
+    );
+
+    // The check filled the cache, so the first request fetches nothing.
+    exposed(&sign_in, &config, "a").await;
+    assert_eq!(a.calls(), 1);
+    assert_eq!(b.calls(), 1);
+}

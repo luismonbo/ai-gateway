@@ -11,8 +11,10 @@ pub(crate) mod fake;
 use crate::config::{Config, Upstream, UpstreamKey};
 use azure_core::credentials::{Secret, TokenCredential};
 use azure_core::http::HttpClient;
+use azure_core::time::OffsetDateTime;
 use azure_identity::Executor;
 use cache::TokenCache;
+use futures::future::join_all;
 use std::error::Error;
 use std::sync::Arc;
 
@@ -125,6 +127,18 @@ impl SignIn {
             .ok_or_else(|| SignInError::Token("no credential for this upstream".to_string()))?;
         let token = cache.token().await?;
         Ok(Some(Bearer::Token(token.token)))
+    }
+
+    /// One token fetch per upstream with `<NAME>_AUTH`, all at once, in
+    /// `UPSTREAMS` order: when each token expires, or why there is none.
+    /// The tokens stay cached for the first requests.
+    pub async fn check(&self) -> Vec<(String, Result<OffsetDateTime, SignInError>)> {
+        let checks = self.caches.iter().map(|(name, cache)| async move {
+            let expires_on = cache.token().await.map(|token| token.expires_on);
+            (name.clone(), expires_on)
+        });
+        // join_all keeps the input order.
+        join_all(checks).await
     }
 
     fn cache(&self, upstream: &str) -> Option<&TokenCache> {
