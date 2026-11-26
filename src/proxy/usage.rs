@@ -24,12 +24,18 @@ pub struct ResponseProbe {
 }
 
 /// `None` unless `json` is a JSON object whose fields have the expected types.
+/// An empty `model` counts as missing: Azure's first stream chunk sends
+/// `"model": ""` before any chunk names the model.
 pub fn probe(json: &[u8]) -> Option<ResponseProbe> {
     // serde would also accept an array and fill the fields in order.
     let is_object = json.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{');
     is_object
-        .then(|| serde_json::from_slice(json).ok())
+        .then(|| serde_json::from_slice::<ResponseProbe>(json).ok())
         .flatten()
+        .map(|found| ResponseProbe {
+            model: found.model.filter(|model| !model.is_empty()),
+            ..found
+        })
 }
 
 #[cfg(test)]
@@ -61,6 +67,13 @@ mod tests {
 
         let null_usage = probe(br#"{"usage":null}"#).unwrap();
         assert_eq!(null_usage.usage, None);
+    }
+
+    #[test]
+    fn probe_treats_an_empty_model_as_missing() {
+        let azure_first_chunk = br#"{"id":"","object":"","created":0,"model":"",
+            "prompt_filter_results":[],"choices":[],"usage":null}"#;
+        assert_eq!(probe(azure_first_chunk).unwrap().model, None);
     }
 
     #[test]

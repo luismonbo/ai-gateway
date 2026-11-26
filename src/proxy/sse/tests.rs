@@ -162,6 +162,17 @@ fn inspector_joins_multiline_data() {
 }
 
 #[test]
+fn inspector_skips_an_empty_model() {
+    let mut inspector = StreamInspector::new(false);
+    inspector.inspect(b"data: {\"model\":\"\",\"choices\":[],\"usage\":null}\n\n");
+    inspector.inspect(b"data: {\"model\":\"gpt-4o-2024-11-20\",\"choices\":[{\"index\":0}]}\n\n");
+    assert_eq!(
+        inspector.summary().model.as_deref(),
+        Some("gpt-4o-2024-11-20")
+    );
+}
+
+#[test]
 fn include_usage_is_injected_only_when_not_requested() {
     let object = |value: serde_json::Value| value.as_object().unwrap().clone();
     let with_options =

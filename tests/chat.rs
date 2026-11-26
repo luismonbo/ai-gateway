@@ -201,6 +201,43 @@ async fn injects_include_usage_and_strips_the_chunk() {
 }
 
 #[actix_web::test]
+async fn records_the_model_from_an_azure_stream() {
+    // Azure's first chunk carries content-filter results and an empty model.
+    let stream = [
+        "data: {\"id\":\"\",\"object\":\"\",\"created\":0,\"model\":\"\",\
+         \"prompt_filter_results\":[],\"choices\":[],\"usage\":null}\n\n",
+        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\
+         \"model\":\"gpt-4o-2024-11-20\",\"choices\":[{\"index\":0,\
+         \"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n",
+        USAGE_EVENT,
+        "data: [DONE]\n\n",
+    ]
+    .concat();
+    let server =
+        upstream(ResponseTemplate::new(200).set_body_raw(stream, "text/event-stream")).await;
+    let url = mock_url(&server);
+    let app = init(state(config(&[("PRIMARY_BASE_URL", &url)]))).await;
+    let body = json!({
+        "model": "primary/m1",
+        "stream": true,
+        "messages": [{"role": "user", "content": "Hello"}]
+    });
+
+    let response = test::call_service(&app, post_chat(&body).to_request()).await;
+    assert_eq!(response.status(), 200);
+    // Stats are recorded when the stream ends.
+    let _ = test::read_body(response).await;
+
+    let stats_request = TestRequest::get()
+        .uri("/v1/stats")
+        .insert_header(bearer(USER_KEY))
+        .to_request();
+    let stats = json_body(test::call_service(&app, stats_request).await).await;
+    assert_eq!(stats["models_used"]["primary/gpt-4o-2024-11-20"], 1);
+    assert_eq!(stats["total_prompt_tokens"], 5);
+}
+
+#[actix_web::test]
 async fn upstream_401_becomes_502_without_its_body() {
     let leaky = json!({"error": {"message": "Incorrect API key provided: sk-proj-****abcd"}});
     let server = upstream(ResponseTemplate::new(401).set_body_json(leaky)).await;
