@@ -6,4 +6,5 @@ pub mod error;
 pub mod logging;
 pub mod proxy;
 pub mod rate_limit;
+pub mod sign_in;
 pub mod stats;
