@@ -2,6 +2,7 @@
 //!
 //! Error messages never repeat a base URL: a mistyped one may hold a secret.
 
+use super::azure::{self, AzureSignIn};
 use super::{ConfigError, Env};
 use reqwest::Url;
 use std::fmt;
@@ -16,6 +17,8 @@ pub struct Upstream {
     /// trailing `/`.
     pub base_url: String,
     pub api_key: Option<UpstreamKey>,
+    /// From `<NAME>_AUTH`: the upstream gets Azure tokens instead of a key.
+    pub sign_in: Option<AzureSignIn>,
     pub fallback: Option<FallbackTarget>,
 }
 
@@ -67,8 +70,8 @@ pub(super) fn upstreams(env: &Env) -> Result<(Vec<Upstream>, Vec<String>), Confi
         .iter()
         .map(|name| upstream(env, name, &names))
         .collect::<Result<Vec<_>, _>>()?;
-    let (upstreams, warnings): (Vec<Upstream>, Vec<Option<String>>) = parsed.into_iter().unzip();
-    Ok((upstreams, warnings.into_iter().flatten().collect()))
+    let (upstreams, warnings): (Vec<Upstream>, Vec<Vec<String>>) = parsed.into_iter().unzip();
+    Ok((upstreams, warnings.concat()))
 }
 
 /// `DEFAULT_UPSTREAM`, which must be one of the configured names.
@@ -125,30 +128,34 @@ fn is_valid_name(name: &str) -> bool {
         .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_'))
 }
 
-/// One upstream's variables, and a warning if its URL has no path.
+/// One upstream's variables, and their warnings.
 fn upstream(
     env: &Env,
     name: &str,
     names: &[String],
-) -> Result<(Upstream, Option<String>), ConfigError> {
+) -> Result<(Upstream, Vec<String>), ConfigError> {
     let prefix = name.to_ascii_uppercase();
     let url_variable = format!("{prefix}_BASE_URL");
     let key_variable = format!("{prefix}_API_KEY");
 
     let url = base_url(env, &url_variable, &key_variable)?;
-    let warning = (url.path() == "/").then(|| {
+    let path_warning = (url.path() == "/").then(|| {
         format!(
             "{url_variable}: the URL has no path; OpenAI-compatible APIs usually need \
              the version path, e.g. https://api.openai.com/v1 or http://localhost:11434/v1"
         )
     });
+    let api_key = env.get(&key_variable).map(UpstreamKey);
+    let (sign_in, sign_in_warnings) = azure::sign_in(env, &prefix, &url, api_key.is_some())?;
     let upstream = Upstream {
         name: name.to_string(),
         base_url: url.as_str().trim_end_matches('/').to_string(),
-        api_key: env.get(&key_variable).map(UpstreamKey),
+        api_key,
+        sign_in,
         fallback: fallback(env, &format!("{prefix}_FALLBACK"), names)?,
     };
-    Ok((upstream, warning))
+    let warnings = path_warning.into_iter().chain(sign_in_warnings).collect();
+    Ok((upstream, warnings))
 }
 
 /// An http(s) URL with no credentials, query string or fragment.

@@ -4,8 +4,10 @@
 //! stops startup with a message naming the variable. Error and warning texts
 //! never contain a key, only its key ID.
 
+mod azure;
 mod upstreams;
 
+pub use azure::{AzureSignIn, SignInMethod, DEFAULT_TOKEN_SCOPE};
 pub use upstreams::{FallbackTarget, Upstream, UpstreamKey};
 
 use crate::auth::{KeyId, KeyStore, KeyStoreError, Role};
@@ -131,14 +133,10 @@ impl Config {
         let address = format!("bind address: {}:{}", self.host, self.port);
         let upstreams = self.upstreams.iter().map(|upstream| {
             format!(
-                "upstream {}: {} (api key: {}, fallback: {})",
+                "upstream {}: {} (auth: {}, fallback: {})",
                 upstream.name,
                 upstream.base_url,
-                if upstream.api_key.is_some() {
-                    "set"
-                } else {
-                    "none"
-                },
+                auth_label(upstream),
                 upstream
                     .fallback
                     .as_ref()
@@ -175,6 +173,15 @@ impl Config {
             .chain(upstreams)
             .chain([default_upstream, limits, rate_limit, stats, keys])
             .collect()
+    }
+}
+
+/// How an upstream authenticates, for the summary. Never contains a key.
+fn auth_label(upstream: &Upstream) -> String {
+    match (&upstream.sign_in, &upstream.api_key) {
+        (Some(sign_in), _) => sign_in.method.to_string(),
+        (None, Some(_)) => "api key".to_string(),
+        (None, None) => "none".to_string(),
     }
 }
 
