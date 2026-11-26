@@ -8,32 +8,71 @@ use crate::proxy::chat::chat_completions;
 use crate::proxy::models::list_models;
 use crate::proxy::upstream::build_http_client;
 use crate::rate_limit::{enforce_rate_limit, RateLimiter};
+use crate::sign_in::transport::ReqwestTransport;
+use crate::sign_in::{SignIn, SignInError};
 use crate::stats::{get_stats, track_request, StatsStore};
 use actix_web::body::MessageBody;
 use actix_web::dev::{ServiceFactory, ServiceRequest, ServiceResponse};
 use actix_web::middleware::from_fn;
 use actix_web::{web, App, HttpRequest, HttpResponse, ResponseError};
+use azure_core::credentials::TokenCredential;
 use std::sync::Arc;
 
 /// Everything the handlers share, built once at startup.
 pub struct AppState {
     pub config: Config,
     /// One client for every upstream request, so connections are reused.
+    /// Sign-in requests go through it too.
     pub http: reqwest::Client,
     pub stats: Arc<StatsStore>,
     pub limiter: RateLimiter,
+    /// Tokens for the upstreams with `<NAME>_AUTH`.
+    pub sign_in: SignIn,
+}
+
+/// Why the app state couldn't be built; startup stops with this message.
+#[derive(Debug, thiserror::Error)]
+pub enum StateError {
+    #[error("could not build the HTTP client: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error(transparent)]
+    SignIn(#[from] SignInError),
 }
 
 impl AppState {
-    pub fn new(config: Config, stats: Arc<StatsStore>) -> reqwest::Result<AppState> {
+    pub fn new(config: Config, stats: Arc<StatsStore>) -> Result<AppState, StateError> {
         let http = build_http_client(&config)?;
+        let transport = Arc::new(ReqwestTransport::new(http.clone()));
+        let sign_in = SignIn::from_config(&config, transport, azure_identity::new_executor())?;
+        Ok(AppState::assemble(config, http, stats, sign_in))
+    }
+
+    /// Like [`AppState::new`], signing in with `credentials`, which name
+    /// their upstream, instead of the real ones. For tests.
+    pub fn with_credentials(
+        config: Config,
+        stats: Arc<StatsStore>,
+        credentials: Vec<(String, Arc<dyn TokenCredential>)>,
+    ) -> Result<AppState, StateError> {
+        let http = build_http_client(&config)?;
+        let sign_in = SignIn::with_credentials(&config, credentials);
+        Ok(AppState::assemble(config, http, stats, sign_in))
+    }
+
+    fn assemble(
+        config: Config,
+        http: reqwest::Client,
+        stats: Arc<StatsStore>,
+        sign_in: SignIn,
+    ) -> AppState {
         let limiter = RateLimiter::new(config.rate_limit_rpm);
-        Ok(AppState {
+        AppState {
             config,
             http,
             stats,
             limiter,
-        })
+            sign_in,
+        }
     }
 }
 

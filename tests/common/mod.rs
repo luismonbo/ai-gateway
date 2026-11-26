@@ -7,8 +7,12 @@ use actix_web::{test, web};
 use ai_gateway::app::{build_app, AppState};
 use ai_gateway::config::Config;
 use ai_gateway::stats::StatsStore;
+use azure_core::credentials::{AccessToken, TokenCredential, TokenRequestOptions};
+use azure_core::error::ErrorKind;
+use azure_core::time::{Duration, OffsetDateTime};
 use serde_json::{json, Value};
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use wiremock::MockServer;
 
@@ -48,7 +52,76 @@ pub fn config(overrides: &[(&str, &str)]) -> Config {
 }
 
 pub fn state(config: Config) -> AppState {
-    AppState::new(config, Arc::new(StatsStore::default())).expect("the HTTP client builds")
+    AppState::new(config, Arc::new(StatsStore::default())).expect("the app state builds")
+}
+
+/// The app state, with `credentials` signing in the upstreams they name.
+pub fn state_with_credentials(
+    config: Config,
+    credentials: &[(&str, Arc<FakeCredential>)],
+) -> AppState {
+    let credentials = credentials
+        .iter()
+        .map(|(name, credential)| {
+            let credential: Arc<dyn TokenCredential> = credential.clone();
+            (name.to_string(), credential)
+        })
+        .collect();
+    AppState::with_credentials(config, Arc::new(StatsStore::default()), credentials)
+        .expect("the app state builds")
+}
+
+/// What a failing [`FakeCredential`] reports.
+pub const SIGN_IN_FAILURE: &str = "fake sign-in failure: please run 'az login'";
+
+/// A token source for tests: always the same token, valid for an hour, or
+/// always [`SIGN_IN_FAILURE`].
+#[derive(Debug)]
+pub struct FakeCredential {
+    token: Option<String>,
+    calls: AtomicUsize,
+}
+
+impl FakeCredential {
+    pub fn ok(token: &str) -> Arc<Self> {
+        Arc::new(Self {
+            token: Some(token.to_string()),
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    pub fn failing() -> Arc<Self> {
+        Arc::new(Self {
+            token: None,
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    /// How many tokens were asked for.
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl TokenCredential for FakeCredential {
+    async fn get_token(
+        &self,
+        _scopes: &[&str],
+        _options: Option<TokenRequestOptions<'_>>,
+    ) -> azure_core::Result<AccessToken> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match &self.token {
+            Some(token) => Ok(AccessToken::new(
+                token.clone(),
+                OffsetDateTime::now_utc() + Duration::hours(1),
+            )),
+            None => Err(azure_core::Error::with_message(
+                ErrorKind::Credential,
+                SIGN_IN_FAILURE,
+            )),
+        }
+    }
 }
 
 /// The whole app, in-process, ready for `test::call_service`.

@@ -69,7 +69,7 @@ async fn main() -> ExitCode {
     let state = match AppState::new(config, Arc::clone(&stats)) {
         Ok(state) => web::Data::new(state),
         Err(e) => {
-            error!("could not build the HTTP client: {e}");
+            error!("{e}");
             return ExitCode::FAILURE;
         }
     };

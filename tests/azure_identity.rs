@@ -8,7 +8,7 @@
 mod common;
 
 use ai_gateway::config::SignInMethod;
-use ai_gateway::sign_in::credentials;
+use ai_gateway::sign_in::{credentials, SignIn, SignInError};
 use async_trait::async_trait;
 use azure_core::http::headers::Headers;
 use azure_core::http::{AsyncRawResponse, Body, HttpClient, Request, StatusCode};
@@ -367,4 +367,27 @@ async fn unsupported_managed_identity_environments_fail_when_built() {
     let err =
         credentials::credential(&method, FakeTransport::new("{}"), FakeAz::new("")).unwrap_err();
     assert!(err.to_string().contains("isn't supported"), "{err}");
+}
+
+#[actix_web::test]
+async fn from_config_names_the_upstream_when_a_credential_cannot_be_built() {
+    let _env = TestEnv::set(&[("MSI_ENDPOINT", "http://localhost:1/msi")]);
+    let config = common::config(&[
+        ("UPSTREAMS", "azure"),
+        ("AZURE_BASE_URL", "https://res.openai.azure.com/openai/v1"),
+        ("AZURE_AUTH", "managed_identity"),
+    ]);
+
+    let err = SignIn::from_config(&config, FakeTransport::new("{}"), FakeAz::new("")).unwrap_err();
+    let SignInError::Setup {
+        upstream,
+        method,
+        reason,
+    } = &err
+    else {
+        panic!("{err:?}");
+    };
+    assert_eq!(upstream, "azure");
+    assert_eq!(method, "managed identity (system-assigned)");
+    assert!(reason.contains("isn't supported"), "{reason}");
 }
