@@ -83,7 +83,8 @@ fn client_id_picks_a_user_assigned_identity() {
 
 #[test]
 fn client_id_accepts_uppercase_and_spaces() {
-    // Copied from the portal: uppercase, with stray spaces.
+    // Copied from the portal: uppercase, with stray spaces. It's kept in
+    // the canonical lowercase form, which every Azure endpoint accepts.
     let pasted = format!("  {}  ", GUID.to_uppercase());
     let sign_in = sign_in_of(&[
         ("AZURE_AUTH", "managed_identity"),
@@ -92,7 +93,7 @@ fn client_id_accepts_uppercase_and_spaces() {
     assert_eq!(
         sign_in.method,
         SignInMethod::ManagedIdentity {
-            client_id: Some("0F7C3A52-8D4E-4B9A-9C1D-2E5F6A7B8C9D".to_string())
+            client_id: Some("0f7c3a52-8d4e-4b9a-9c1d-2e5f6a7b8c9d".to_string())
         }
     );
 }

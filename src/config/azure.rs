@@ -152,11 +152,12 @@ fn managed_identity(env: &Env, names: &Names) -> Result<SignInMethod, ConfigErro
     }
 }
 
-/// A client ID is a GUID. The message never repeats the value, which might
-/// be a client secret pasted into the wrong variable.
+/// A client ID is a GUID, kept in lowercase, its canonical form. The message
+/// never repeats the value, which might be a client secret pasted into the
+/// wrong variable.
 fn client_id(variable: &str, value: String) -> Result<String, ConfigError> {
     if is_guid(&value) {
-        return Ok(value);
+        return Ok(value.to_ascii_lowercase());
     }
     let message = if value.starts_with("/subscriptions/") {
         "looks like a resource ID; use the identity's client ID, a GUID such as \
