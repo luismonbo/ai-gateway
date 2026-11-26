@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2021"
 description = "An OpenAI-compatible gateway that routes requests to Ollama, OpenAI, Azure OpenAI and other OpenAI-style backends by model prefix, with API keys, keyless Azure sign-in, rate limits, fallback and usage stats"
 license = "Apache-2.0"
-repository = "https://github.com/LuisMongeB/ai-gateway"
+repository = "https://github.com/luismonbo/ai-gateway"
 
 [dependencies]
 # No default features: no request decompression, cookies or HTTP/2, none of which the gateway uses.
