@@ -8,8 +8,10 @@
 mod common;
 
 use ai_gateway::config::SignInMethod;
+use ai_gateway::sign_in::cache::TokenCache;
 use ai_gateway::sign_in::{credentials, SignIn, SignInError};
 use async_trait::async_trait;
+use azure_core::credentials::TokenCredential;
 use azure_core::http::headers::Headers;
 use azure_core::http::{AsyncRawResponse, Body, HttpClient, Request, StatusCode};
 use azure_core::time::{Duration, OffsetDateTime};
@@ -223,6 +225,21 @@ fn pair(name: &str, value: &str) -> (String, String) {
     (name.to_string(), value.to_string())
 }
 
+fn text(logs: &Mutex<Vec<u8>>) -> String {
+    String::from_utf8_lossy(&logs.lock().unwrap_or_else(PoisonError::into_inner)).into_owned()
+}
+
+/// What the gateway logs and answers when `credential` can't sign in.
+async fn sign_in_error(credential: Arc<dyn TokenCredential>) -> String {
+    let timeout = std::time::Duration::from_secs(5);
+    let cache = TokenCache::new("azure".to_string(), credential, SCOPE.to_string(), timeout);
+    cache
+        .token()
+        .await
+        .expect_err("signing in fails")
+        .to_string()
+}
+
 #[actix_web::test]
 async fn vm_managed_identity_asks_the_metadata_endpoint() {
     let _env = TestEnv::set(&[]);
@@ -296,6 +313,7 @@ async fn workload_identity_exchanges_the_service_account_token() {
             token_file.path().to_str().unwrap(),
         ),
     ]);
+    let (_guard, logs) = common::capture_logs();
 
     // Without a client ID of its own, it uses the one AKS injected.
     let transport = FakeTransport::new(&entra_reply("wi-token"));
@@ -333,11 +351,20 @@ async fn workload_identity_exchanges_the_service_account_token() {
         body.contains(&format!("client_id={OTHER_CLIENT_ID}")),
         "{body}"
     );
+
+    // The crates log the requests, but neither the Entra token nor the
+    // service account token, which can be exchanged for one.
+    let logs = text(&logs);
+    assert!(logs.contains("login.microsoftonline.com"), "{logs}");
+    for secret in ["wi-token", "k8s-sa-token"] {
+        assert!(!logs.contains(secret), "{secret}: {logs}");
+    }
 }
 
 #[actix_web::test]
 async fn azure_cli_runs_az() {
     let _env = TestEnv::set(&[]);
+    let (_guard, logs) = common::capture_logs();
     let az = FakeAz::new(&cli_reply("cli-token"));
     let credential = credentials::credential(
         &SignInMethod::AzureCli,
@@ -356,6 +383,9 @@ async fn azure_cli_runs_az() {
         "{commands:?}"
     );
     assert!(commands[0].contains("https://ai.azure.com"), "{commands:?}");
+    // `az` prints the token; nothing logs what it printed.
+    let logs = text(&logs);
+    assert!(!logs.contains("cli-token"), "{logs}");
 }
 
 #[actix_web::test]
@@ -390,4 +420,70 @@ async fn from_config_names_the_upstream_when_a_credential_cannot_be_built() {
     assert_eq!(upstream, "azure");
     assert_eq!(method, "managed identity (system-assigned)");
     assert!(reason.contains("isn't supported"), "{reason}");
+}
+
+#[actix_web::test]
+async fn malformed_cli_replies_keep_the_token_out_of_errors() {
+    let _env = TestEnv::set(&[]);
+    // Azure CLI before 2.54 prints no expires_on; a reply may also carry a
+    // field of the wrong type.
+    let old_cli = r#"{"accessToken":"cli-old-secret-1","expiresOn":"2026-11-26 13:00:00.000000","subscription":"s","tenant":"t","tokenType":"Bearer"}"#;
+    let wrong_type =
+        r#"{"accessToken":"cli-type-secret-2","expires_on":"1800000000","tokenType":"Bearer"}"#;
+
+    for (stdout, secret) in [
+        (old_cli, "cli-old-secret-1"),
+        (wrong_type, "cli-type-secret-2"),
+    ] {
+        let credential = credentials::credential(
+            &SignInMethod::AzureCli,
+            FakeTransport::new("{}"),
+            FakeAz::new(stdout),
+        )
+        .unwrap();
+        let message = sign_in_error(credential).await;
+        assert!(message.contains("AzureCliCredential"), "{message}");
+        assert!(!message.contains(secret), "{message}");
+        if secret == "cli-old-secret-1" {
+            // The operator learns what to do.
+            assert!(message.contains("2.54"), "{message}");
+        }
+    }
+}
+
+#[actix_web::test]
+async fn malformed_managed_identity_replies_keep_the_token_out_of_errors() {
+    let _env = TestEnv::set(&[]);
+    let reply = r#"{"access_token":"mi-secret-token-3","expires_on":"not-a-number","resource":"https://ai.azure.com","token_type":"Bearer"}"#;
+    let method = SignInMethod::ManagedIdentity { client_id: None };
+    let credential =
+        credentials::credential(&method, FakeTransport::new(reply), FakeAz::new("")).unwrap();
+
+    let message = sign_in_error(credential).await;
+    // The crate's own error text comes through, so a token in it would too.
+    assert!(message.contains("ManagedIdentityCredential"), "{message}");
+    assert!(!message.contains("mi-secret-token-3"), "{message}");
+}
+
+#[actix_web::test]
+async fn malformed_entra_replies_keep_the_token_out_of_errors() {
+    let token_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(token_file.path(), "k8s-sa-token").unwrap();
+    let _env = TestEnv::set(&[
+        ("AZURE_TENANT_ID", TENANT_ID),
+        ("AZURE_CLIENT_ID", CLIENT_ID),
+        (
+            "AZURE_FEDERATED_TOKEN_FILE",
+            token_file.path().to_str().unwrap(),
+        ),
+    ]);
+    let reply = r#"{"token_type":"Bearer","expires_in":"soon","ext_expires_in":3599,"access_token":"wi-secret-token-4"}"#;
+    let method = SignInMethod::WorkloadIdentity { client_id: None };
+    let credential =
+        credentials::credential(&method, FakeTransport::new(reply), FakeAz::new("")).unwrap();
+
+    let message = sign_in_error(credential).await;
+    assert!(message.contains("WorkloadIdentityCredential"), "{message}");
+    assert!(!message.contains("wi-secret-token-4"), "{message}");
+    assert!(!message.contains("k8s-sa-token"), "{message}");
 }
